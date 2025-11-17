@@ -101,6 +101,18 @@ public:
            const std::shared_ptr<tf2_ros::TransformListener> &external_tf_listener);
     ~VDBMap();
 
+    bool query_log_odds_at_world(const Eigen::Vector3d &p_world, float &logodds_out) const;
+    bool query_log_odds_at_index(const openvdb::Coord &ijk, float &logodds_out) const;
+
+    bool query_sqdist_at_world(const Eigen::Vector3d &p_world, double &sqdist_out) const;
+    bool query_sqdist_at_index(const openvdb::Coord &ijk, double &sqdist_out) const;
+
+    bool ray_esdf_clear_index(const openvdb::Coord &c0,
+                              const openvdb::Coord &c1,
+                              double min_clearance,
+                              openvdb::Coord &hit_point) const;
+    
+    openvdb::math::Transform::ConstPtr get_grid_transform() const;
 private:
     // General parameters
     std::string pcl_topic;
@@ -128,6 +140,8 @@ private:
     rclcpp::Node::SharedPtr node_handle_;
 
     rclcpp::Time last_timing_print_;
+
+    openvdb::math::Transform::Ptr grid_transform_;
 
 public:
     std::string get_node_name() const;
@@ -203,7 +217,7 @@ private:
 
 private: // occupancy map
     void initialize();
-    std::shared_mutex map_mutex;
+    mutable std::shared_mutex map_mutex;
 
     openvdb::FloatGrid::Ptr grid_logocc_;
 
@@ -324,7 +338,7 @@ private:
     }
 
     inline bool check_surface_frontier_26(const openvdb::FloatGrid::ConstAccessor &acc,
-                                         const openvdb::Coord &ijk)
+                                          const openvdb::Coord &ijk)
     {
         const float occ_thresh = static_cast<float>(L_THRESH);
         float v = 0.f;

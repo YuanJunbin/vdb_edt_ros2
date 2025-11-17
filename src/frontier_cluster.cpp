@@ -639,14 +639,14 @@ int FrontierManager::count_visible_cells(
 
 void FrontierManager::update_frontier_cost_matrix()
 {
-    std::cout << "cost mat size before remove: " << std::endl;
-    for (auto &ftr : frontiers_)
-    {
-        std::cout << "(" << ftr.costs_.size() << "," << ftr.paths_.size() << "), ";
-    }
-    std::cout << std::endl;
+    // std::cout << "cost mat size before remove: " << std::endl;
+    // for (auto &ftr : frontiers_)
+    // {
+    //     std::cout << "(" << ftr.costs_.size() << "," << ftr.paths_.size() << "), ";
+    // }
+    // std::cout << std::endl;
 
-    std::cout << "cost mat size remove: " << std::endl;
+    // std::cout << "cost mat size remove: " << std::endl;
     if (!removed_ids_.empty())
     {
         // 对所有“旧 frontier”（first_new_cluster_ 之前的）删掉被移除 cluster 对应的列
@@ -672,17 +672,17 @@ void FrontierManager::update_frontier_cost_matrix()
                 path_iter = it->paths_.erase(path_iter);
                 // 注意：这里不 ++iter_idx，因为 after erase, current position is still rid
             }
-            std::cout << "(" << it->costs_.size() << "," << it->paths_.size() << "), ";
+            // std::cout << "(" << it->costs_.size() << "," << it->paths_.size() << "), ";
         }
         removed_ids_.clear();
     }
-    std::cout << std::endl;
+    // std::cout << std::endl;
 
     // 小工具：给两个 cluster 更新双向 cost / path
     auto updateCost = [this](const std::list<FrontierCluster>::iterator &it1,
                              const std::list<FrontierCluster>::iterator &it2)
     {
-        std::cout << "(" << it1->id_ << "," << it2->id_ << "), ";
+        // std::cout << "(" << it1->id_ << "," << it2->id_ << "), ";
 
         // Viewpoints first, if no viewpoints, use centroid
         const Eigen::Vector3d p1 = it1->viewpoints_.empty()
@@ -728,7 +728,7 @@ void FrontierManager::update_frontier_cost_matrix()
         }
     }
 
-    std::cout << std::endl;
+    // std::cout << std::endl;
 }
 
 double FrontierManager::computeCost(const Eigen::Vector3d &p1,
@@ -792,4 +792,69 @@ void FrontierManager::export_viewpoints(std::vector<Viewpoint> &out) const
             out.push_back(ftr.viewpoints_.front());
         }
     }
+}
+
+void FrontierManager::collect_ranked_best_viewpoints(const Eigen::Vector3d &robot_pos,
+                                                     std::vector<ScoredViewpoint> &out) const
+{
+    out.clear();
+
+    // candidates
+    std::vector<const Viewpoint *> candidates;
+    candidates.reserve(frontiers_.size());
+
+    for (const auto &ftr : frontiers_)
+    {
+        if (ftr.viewpoints_.empty())
+        {
+            continue;
+        }
+        candidates.push_back(&ftr.viewpoints_.front());
+    }
+    if (candidates.empty())
+    {
+        return;
+    }
+
+    // Normalize visib num
+    int max_visib = 0;
+    for (const auto *vp : candidates)
+    {
+        if (vp->visib_num_ > max_visib)
+        {
+            max_visib = vp->visib_num_;
+        }
+    }
+
+    if (max_visib <= 0)
+    {
+        max_visib = 1;
+    }
+
+    const double dist_scale = (viewpoint_rmax_ > 1e-3) ? viewpoint_rmax_ : 1.0;
+    const double w_info = 0.7;
+    const double w_dist = 0.3;
+
+    out.reserve(candidates.size());
+    for (const auto *vp : candidates)
+    {
+        ScoredViewpoint sv;
+        sv.pos_ = vp->pos_;
+        sv.yaw_ = vp->yaw_;
+        sv.visib_num_ = vp->visib_num_;
+
+        const double d = (vp->pos_ - robot_pos).norm();
+        const double info_term = static_cast<double>(vp->visib_num_) /
+                                 static_cast<double>(max_visib);
+        const double dist_term = 1.0 / (1.0 + d / dist_scale);
+
+        sv.score_ = w_info * info_term + w_dist * dist_term;
+        out.push_back(sv);
+    }
+
+    std::sort(out.begin(), out.end(),
+              [](const ScoredViewpoint &a, const ScoredViewpoint &b)
+              {
+                  return a.score_ > b.score_;
+              });
 }

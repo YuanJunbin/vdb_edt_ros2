@@ -174,7 +174,7 @@ void VDBMap::initialize()
     // General synced dataset via message_filters + tf2 MessageFilter
     cloud_sub_mf_.subscribe(node_handle_.get(), pcl_topic, rclcpp::SensorDataQoS().get_rmw_qos_profile());
     cloud_filter_ = std::make_unique<tf2_ros::MessageFilter<sensor_msgs::msg::PointCloud2>>(
-        cloud_sub_mf_, *tf_buffer_, worldframeId, 500, node_handle_);
+        cloud_sub_mf_, *tf_buffer_, worldframeId, 10, node_handle_);
     cloud_filter_->registerCallback(std::bind(&VDBMap::cloud_callback, this, std::placeholders::_1));
 
     RCLCPP_INFO(node_handle_->get_logger(), "[%s] VDBMap initialized.", node_name_.c_str());
@@ -217,10 +217,33 @@ rclcpp::Node::SharedPtr VDBMap::get_node_handle() const
 
 void VDBMap::set_voxel_size(openvdb::GridBase &grid, double vs)
 {
-    const openvdb::math::Vec3d offset(vs / 2., vs / 2., vs / 2.);
-    openvdb::math::Transform::Ptr tf = openvdb::math::Transform::createLinearTransform(vs);
-    tf->postTranslate(offset);
-    grid.setTransform(tf);
+    // const openvdb::math::Vec3d offset(vs / 2., vs / 2., vs / 2.);
+    grid_transform_ = openvdb::math::Transform::createLinearTransform(vs);
+    // tf->postTranslate(offset);
+    grid.setTransform(grid_transform_);
+
+    // openvdb::Vec3d xyz_0(0.0, 0.0, 0.0);
+    // openvdb::Vec3d xyz_1(1.0, 1.0, 1.0);
+
+    // openvdb::Vec3d ijk_0d = tf->worldToIndex(xyz_0);
+    // openvdb::Vec3d ijk_1d = tf->worldToIndex(xyz_1);
+
+    // openvdb::Vec3d ijk_0(0.0, 0.0, 0.0);
+    // openvdb::Vec3d ijk_1(1.0, 1.0, 1.0);
+
+    // openvdb::Vec3d xyz_0d = tf->indexToWorld(ijk_0);
+    // openvdb::Vec3d xyz_1d = tf->indexToWorld(ijk_1);
+
+    // RCLCPP_INFO_STREAM(node_handle_->get_logger(), "check xyz position: xyz = " << xyz_0 << ", mapping to ijk = " << ijk_0d);
+    // RCLCPP_INFO_STREAM(node_handle_->get_logger(), "check xyz position: xyz = " << xyz_1 << ", mapping to ijk = " << ijk_1d);
+
+    // RCLCPP_INFO_STREAM(node_handle_->get_logger(), "check ijk position: ijk = " << ijk_0 << ", mapping to xyz = " << xyz_0d);
+    // RCLCPP_INFO_STREAM(node_handle_->get_logger(), "check ijk position: ijk = " << ijk_1 << ", mapping to xyz = " << xyz_1d);
+}
+
+openvdb::math::Transform::ConstPtr VDBMap::get_grid_transform() const
+{
+    return grid_transform_;
 }
 
 void VDBMap::setup_parameters()
@@ -351,6 +374,129 @@ bool VDBMap::load_planning_para()
     return true;
 }
 
+// Get value in grids
+bool VDBMap::query_log_odds_at_world(const Eigen::Vector3d &p_world, float &logodds_out) const
+{
+    if (!grid_logocc_)
+    {
+        return false;
+    }
+
+    const openvdb::Vec3d w(p_world.x(), p_world.y(), p_world.z());
+    const openvdb::Vec3d ijk_d = grid_logocc_->worldToIndex(w);
+    const openvdb::Coord ijk = openvdb::Coord::round(ijk_d);
+
+    return query_log_odds_at_index(ijk, logodds_out);
+}
+
+bool VDBMap::query_log_odds_at_index(const openvdb::Coord &ijk, float &logodds_out) const
+{
+    if (!grid_logocc_)
+    {
+        return false;
+    }
+
+    std::shared_lock<std::shared_mutex> rlk(map_mutex);
+
+    openvdb::FloatGrid::ConstAccessor acc = grid_logocc_->getConstAccessor();
+    float v = 0.0f;
+    if (!acc.probeValue(ijk, v))
+    {
+        return false;
+    }
+
+    logodds_out = v;
+    return true;
+}
+
+bool VDBMap::query_sqdist_at_world(const Eigen::Vector3d &p_world, double &sqdist_out) const
+{
+    if (!dist_map_ || !grid_distance_)
+    {
+        return false;
+    }
+
+    const openvdb::Vec3d w(p_world.x(), p_world.y(), p_world.z());
+    const openvdb::Vec3d ijk_d = dist_map_->worldToIndex(w);
+    const openvdb::Coord ijk = openvdb::Coord::round(ijk_d);
+
+    return query_sqdist_at_index(ijk, sqdist_out);
+}
+
+bool VDBMap::query_sqdist_at_index(const openvdb::Coord &ijk, double &sqdist_out) const
+{
+    if (!dist_map_ || !grid_distance_)
+    {
+        return false;
+    }
+
+    std::shared_lock<std::shared_mutex> rlk(map_mutex);
+
+    double sq = grid_distance_->query_sq_distance(ijk);
+    if (sq < 0.0)
+    {
+        return false;
+    }
+
+    sqdist_out = sq;
+    return true;
+}
+
+bool VDBMap::ray_esdf_clear_index(const openvdb::Coord &c0,
+                                  const openvdb::Coord &c1,
+                                  double min_clearance,
+                                  openvdb::Coord &hit_point) const
+{
+    if (!dist_map_ || !grid_distance_)
+        return false;
+
+    const openvdb::Vec3d p0_ijk(c0.x(), c0.y(), c0.z());
+    const openvdb::Vec3d p1_ijk(c1.x(), c1.y(), c1.z());
+    openvdb::Vec3d dir = p1_ijk - p0_ijk;
+    const double len = dir.length();
+
+    if (len <= 1e-9)
+    {
+        double sq = grid_distance_->query_sq_distance(c0);
+        return (sq >= min_clearance * min_clearance);
+    }
+
+    dir /= len;
+
+    openvdb::math::Ray<double> ray(p0_ijk, dir);
+
+    const double eps = 1e-6;
+    openvdb::math::DDA<openvdb::math::Ray<double>, 0> dda(ray, 0.0, len + eps);
+    std::shared_lock<std::shared_mutex> rlk(map_mutex);
+
+    double min_sq_clearance = min_clearance * min_clearance;
+
+    for (;;)
+    {
+        const openvdb::Coord vox = dda.voxel();
+
+        double sq = grid_distance_->query_sq_distance(vox);
+
+        if (sq < min_sq_clearance)
+        {
+            hit_point = vox;
+            return false;
+        }
+
+        if (vox == c1)
+        {
+            break;
+        }
+
+        if (!(dda.time() < dda.maxTime()))
+        {
+            break;
+        }
+        dda.step();
+    }
+    return true;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Callbacks
 
@@ -360,8 +506,9 @@ void VDBMap::cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     geometry_msgs::msg::TransformStamped transform;
     try
     {
-        transform = tf_buffer_->lookupTransform(
-            worldframeId, pc_msg->header.frame_id, pc_msg->header.stamp, rclcpp::Duration::from_seconds(0.05));
+        transform = tf_buffer_->lookupTransform(worldframeId,
+                                                pc_msg->header.frame_id,
+                                                pc_msg->header.stamp);
     }
     catch (const tf2::TransformException &ex)
     {
@@ -742,7 +889,9 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
             const openvdb::Coord cur = dda.voxel();
             // If stepping further would exceed/meet maxTime, `cur` is the hit voxel → don't add FREE.
             if (!(dda.time() < dda.maxTime()))
+            {
                 break;
+            }
             ll_delta[cur] += static_cast<float>(L_FREE);
             dda.step();
         }

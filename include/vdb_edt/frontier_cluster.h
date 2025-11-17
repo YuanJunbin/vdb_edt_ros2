@@ -24,6 +24,14 @@ struct Viewpoint
     int visib_num_;
 };
 
+struct ScoredViewpoint
+{
+    Eigen::Vector3d pos_;
+    double yaw_;
+    int visib_num_;
+    double score_;
+};
+
 struct FrontierCluster
 {
     // Frontier voxels in the cluster
@@ -137,9 +145,12 @@ public:
 
     void update_frontier_cost_matrix();
 
-    void clusters_to_pcl(pcl::PointCloud<pcl::PointXYZI>::Ptr& cloud_out);
-    
-    void export_viewpoints(std::vector<Viewpoint>& out) const;
+    void clusters_to_pcl(pcl::PointCloud<pcl::PointXYZI>::Ptr &cloud_out);
+
+    void export_viewpoints(std::vector<Viewpoint> &out) const;
+
+    void collect_ranked_best_viewpoints(const Eigen::Vector3d &robot_pos,
+                                        std::vector<ScoredViewpoint> &out) const;
 };
 
 #endif
