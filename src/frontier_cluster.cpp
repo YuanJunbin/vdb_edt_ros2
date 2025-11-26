@@ -9,13 +9,13 @@
 #include <Eigen/Eigenvalues>
 
 FrontierManager::FrontierManager()
-    : min_cluster_size_(10),  // 一个 cluster 里至少 10 个体素
+    : min_cluster_size_(5),  // 一个 cluster 里至少 10 个体素
       down_sample_rate_(2.0), // 视点抽样：voxel_size * 2 做 VoxelGrid
       cluster_size_xy_(3.0),  // XY 上超过 3m 就考虑 split
 
-      safe_robot_r_(0.8),          // EDT 安全距离
+      safe_robot_r_(0.5),          // EDT 安全距离
       candidate_dphi_(M_PI / 8.0), // 每 22.5 度采样一个 viewpoint
-      viewpoint_rmin_(0.5),        // viewpoint 离 frontier 中心最小半径
+      viewpoint_rmin_(1.0),        // viewpoint 离 frontier 中心最小半径
       viewpoint_rmax_(2.0),        // 最大半径
       candidate_rnum_(3),          // 半径上采 3 个圈
       min_visib_num_(3),           // 至少看到 3 个 downsample 后 cell 才算有效视点

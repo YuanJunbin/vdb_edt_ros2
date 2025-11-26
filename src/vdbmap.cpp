@@ -411,11 +411,6 @@ bool VDBMap::query_log_odds_at_index(const openvdb::Coord &ijk, float &logodds_o
 
 bool VDBMap::query_sqdist_at_world(const Eigen::Vector3d &p_world, double &sqdist_out) const
 {
-    if (!dist_map_ || !grid_distance_)
-    {
-        return false;
-    }
-
     const openvdb::Vec3d w(p_world.x(), p_world.y(), p_world.z());
     const openvdb::Vec3d ijk_d = dist_map_->worldToIndex(w);
     const openvdb::Coord ijk = openvdb::Coord::round(ijk_d);
@@ -425,14 +420,11 @@ bool VDBMap::query_sqdist_at_world(const Eigen::Vector3d &p_world, double &sqdis
 
 bool VDBMap::query_sqdist_at_index(const openvdb::Coord &ijk, double &sqdist_out) const
 {
-    if (!dist_map_ || !grid_distance_)
-    {
-        return false;
-    }
-
     std::shared_lock<std::shared_mutex> rlk(map_mutex);
 
     double sq = grid_distance_->query_sq_distance(ijk);
+    
+    // unknown, no value at dist map
     if (sq < 0.0)
     {
         return false;
@@ -447,9 +439,6 @@ bool VDBMap::ray_esdf_clear_index(const openvdb::Coord &c0,
                                   double min_clearance,
                                   openvdb::Coord &hit_point) const
 {
-    if (!dist_map_ || !grid_distance_)
-        return false;
-
     const openvdb::Vec3d p0_ijk(c0.x(), c0.y(), c0.z());
     const openvdb::Vec3d p1_ijk(c1.x(), c1.y(), c1.z());
     openvdb::Vec3d dir = p1_ijk - p0_ijk;
