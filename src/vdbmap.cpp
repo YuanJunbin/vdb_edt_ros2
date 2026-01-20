@@ -423,7 +423,7 @@ bool VDBMap::query_sqdist_at_index(const openvdb::Coord &ijk, double &sqdist_out
     std::shared_lock<std::shared_mutex> rlk(map_mutex);
 
     double sq = grid_distance_->query_sq_distance(ijk);
-    
+
     // unknown, no value at dist map
     if (sq < 0.0)
     {
@@ -467,6 +467,58 @@ bool VDBMap::ray_esdf_clear_index(const openvdb::Coord &c0,
         double sq = grid_distance_->query_sq_distance(vox);
 
         if (sq < min_sq_clearance)
+        {
+            hit_point = vox;
+            return false;
+        }
+
+        if (vox == c1)
+        {
+            break;
+        }
+
+        if (!(dda.time() < dda.maxTime()))
+        {
+            break;
+        }
+        dda.step();
+    }
+    return true;
+}
+
+bool VDBMap::ray_esdf_clear_index_optimistic(const openvdb::Coord &c0,
+                                             const openvdb::Coord &c1,
+                                             double min_clearance,
+                                             openvdb::Coord &hit_point) const
+{
+    const openvdb::Vec3d p0_ijk(c0.x(), c0.y(), c0.z());
+    const openvdb::Vec3d p1_ijk(c1.x(), c1.y(), c1.z());
+    openvdb::Vec3d dir = p1_ijk - p0_ijk;
+    const double len = dir.length();
+
+    if (len <= 1e-9)
+    {
+        double sq = grid_distance_->query_sq_distance(c0);
+        return (sq >= min_clearance * min_clearance);
+    }
+
+    dir /= len;
+
+    openvdb::math::Ray<double> ray(p0_ijk, dir);
+
+    const double eps = 1e-6;
+    openvdb::math::DDA<openvdb::math::Ray<double>, 0> dda(ray, 0.0, len + eps);
+    std::shared_lock<std::shared_mutex> rlk(map_mutex);
+
+    double min_sq_clearance = min_clearance * min_clearance;
+
+    for (;;)
+    {
+        const openvdb::Coord vox = dda.voxel();
+
+        double sq = grid_distance_->query_sq_distance(vox);
+
+        if (sq >= 0 && sq < min_sq_clearance)
         {
             hit_point = vox;
             return false;
@@ -864,8 +916,13 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
             grid_map->worldToIndex(openvdb::Vec3d(pt.x, pt.y, pt.z));
         openvdb::Vec3d dir = p_ijk - origin_ijk;
         const double range = dir.length();
-        if (range <= 1e-6)
+        // if (range <= 1e-6)
+        //     {continue;}
+        double MIN_RANGE = 0.6;
+        if (range < MIN_RANGE)
+        {
             continue;
+        }
         dir.normalize();
 
         openvdb::math::Ray<double> ray(origin_ijk, dir);
@@ -1082,9 +1139,9 @@ void VDBMap::update_frontier()
                 continue;
             }
             const openvdb::Coord ijk = iter.getCoord();
-            // if (!check_frontier_6(occgrid_acc, ijk))
+            if (!check_frontier_6(occgrid_acc, ijk))
             // if (!check_surface_frontier_6(occgrid_acc, ijk))
-            if (!check_surface_frontier_26(occgrid_acc, ijk))
+            // if (!check_surface_frontier_26(occgrid_acc, ijk))
             {
                 to_off.push_back(ijk);
             }
@@ -1099,9 +1156,9 @@ void VDBMap::update_frontier()
             {
                 continue;
             }
-            // if (check_frontier_6(occgrid_acc, ijk))
+            if (check_frontier_6(occgrid_acc, ijk))
             // if (check_surface_frontier_6(occgrid_acc, ijk))
-            if (check_surface_frontier_26(occgrid_acc, ijk))
+            // if (check_surface_frontier_26(occgrid_acc, ijk))
             {
                 to_on.push_back(ijk);
             }
@@ -1122,16 +1179,16 @@ void VDBMap::update_frontier()
     openvdb::FloatGrid::ConstAccessor occgrid_acc_read = grid_logocc_->getConstAccessor();
 
     // Frontier Clustering
-    RCLCPP_INFO(node_handle_->get_logger(), "Start clustering.");
+    // RCLCPP_INFO(node_handle_->get_logger(), "Start clustering.");
     openvdb::CoordBBox expanded_box = frontier_manager_.expand_update_box(update_box, VOX_SIZE);
     frontier_manager_.reset_changed_clusters(expanded_box, frontier_acc_read);
-    RCLCPP_INFO(node_handle_->get_logger(), "Reset changed clusters.");
+    // RCLCPP_INFO(node_handle_->get_logger(), "Reset changed clusters.");
     frontier_manager_.frontier_clustering(grid_frontier_, expanded_box);
-    RCLCPP_INFO(node_handle_->get_logger(), "Frontier clustered.");
+    // RCLCPP_INFO(node_handle_->get_logger(), "Frontier clustered.");
     frontier_manager_.compute_frontiers_to_visit(occgrid_acc_read, grid_distance_);
-    RCLCPP_INFO(node_handle_->get_logger(), "viewpoints generated.");
+    // RCLCPP_INFO(node_handle_->get_logger(), "viewpoints generated.");
     frontier_manager_.update_frontier_cost_matrix();
-    RCLCPP_INFO(node_handle_->get_logger(), "Cost matrix updated.");
+    // RCLCPP_INFO(node_handle_->get_logger(), "Cost matrix updated.");
 
     vis_frontier();
     vis_frontier_clusters();

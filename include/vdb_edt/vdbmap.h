@@ -111,8 +111,14 @@ public:
                               const openvdb::Coord &c1,
                               double min_clearance,
                               openvdb::Coord &hit_point) const;
-    
+
+    bool ray_esdf_clear_index_optimistic(const openvdb::Coord &c0,
+                                         const openvdb::Coord &c1,
+                                         double min_clearance,
+                                         openvdb::Coord &hit_point) const;
+
     openvdb::math::Transform::ConstPtr get_grid_transform() const;
+
 private:
     // General parameters
     std::string pcl_topic;
