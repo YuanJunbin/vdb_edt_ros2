@@ -11,7 +11,7 @@
 FrontierManager::FrontierManager()
     : min_cluster_size_(5),  // 一个 cluster 里至少 5 个体素
       down_sample_rate_(2.0), // 视点抽样：voxel_size * 2 做 VoxelGrid
-      cluster_size_xy_(0.5),  // XY 上超过 3m 就考虑 split
+      cluster_size_xy_(3),  // XY 上超过 3m 就考虑 split
 
       safe_robot_r_(0.5),          // EDT 安全距离
       candidate_dphi_(M_PI / 8.0), // 每 22.5 度采样一个 viewpoint

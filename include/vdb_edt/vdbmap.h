@@ -187,21 +187,11 @@ public:
     Eigen::Vector3d origin_;
     geometry_msgs::msg::TransformStamped latest_pose_;
 
-    // NOTE(ROS2): dataset-specific subscriptions
-    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lady_cow_cloud_sub_;
-    rclcpp::Subscription<geometry_msgs::msg::TransformStamped>::SharedPtr lady_cow_pose_sub_;
-
     // Use ConstSharedPtr to avoid large copies and reduce memory footprint.
     std::queue<geometry_msgs::msg::TransformStamped::ConstSharedPtr> pose_queue_;
     std::queue<sensor_msgs::msg::PointCloud2::ConstSharedPtr> cloud_queue_;
 
 public:
-    void sync_pose_and_cloud_fiesta();
-    bool sync_pose_and_cloud(geometry_msgs::msg::TransformStamped &latest_pose,
-                             const sensor_msgs::msg::PointCloud2 &latest_cloud);
-    void lady_cow_pose_callback(const geometry_msgs::msg::TransformStamped::ConstSharedPtr &pose);
-    void lady_cow_cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud);
-
     // a hash tool, for lower version of openvdb without coord hash
 private:
     struct CoordHash
@@ -282,10 +272,16 @@ private:
     void vis_frontier_clusters();
     void vis_frontier_viewpoints();
 
-    inline bool check_frontier_6(const openvdb::FloatGrid::ConstAccessor &acc,
-                                 const openvdb::Coord &ijk)
+    // 0: check_frontier_6
+    // 1: check_surface_frontier_6
+    // 2: check_surface_frontier_26 (default)
+    int frontier_type_;
+
+    static inline bool check_frontier_6(const openvdb::FloatGrid::ConstAccessor &acc,
+                                 const openvdb::Coord &ijk,
+                                 const double threshold)
     {
-        const float occ_thresh = static_cast<float>(L_THRESH);
+        const float occ_thresh = static_cast<float>(threshold);
         float v = 0.f;
         if (!(acc.probeValue(ijk, v) && v < occ_thresh))
         {
@@ -307,10 +303,11 @@ private:
         }
         return false;
     }
-    inline bool check_surface_frontier_6(const openvdb::FloatGrid::ConstAccessor &acc,
-                                         const openvdb::Coord &ijk)
+    static inline bool check_surface_frontier_6(const openvdb::FloatGrid::ConstAccessor &acc,
+                                         const openvdb::Coord &ijk,
+                                         const double threshold)
     {
-        const float occ_thresh = static_cast<float>(L_THRESH);
+        const float occ_thresh = static_cast<float>(threshold);
         float v = 0.f;
         if (!(acc.probeValue(ijk, v) && v < occ_thresh))
         {
@@ -343,10 +340,11 @@ private:
         return false;
     }
 
-    inline bool check_surface_frontier_26(const openvdb::FloatGrid::ConstAccessor &acc,
-                                          const openvdb::Coord &ijk)
+    static inline bool check_surface_frontier_26(const openvdb::FloatGrid::ConstAccessor &acc,
+                                          const openvdb::Coord &ijk,
+                                          const double threshold)
     {
-        const float occ_thresh = static_cast<float>(L_THRESH);
+        const float occ_thresh = static_cast<float>(threshold);
         float v = 0.f;
         if (!(acc.probeValue(ijk, v) && v < occ_thresh))
         {

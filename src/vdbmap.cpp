@@ -39,8 +39,6 @@
 #include <algorithm>
 #include <cstdint>
 
-// # define ASYNC_SPINNER
-
 VDBMap::VDBMap()
     : L_FREE(-0.13), L_OCCU(+1.01), L_THRESH(0.0), L_MIN(-2.0), L_MAX(+3.5), VOX_SIZE(0.2),
       START_RANGE(0.0), SENSOR_RANGE(5.0), HIT_THICKNESS(1), VERSION(1),
@@ -93,20 +91,6 @@ void VDBMap::initialize()
     RCLCPP_INFO(node_handle_->get_logger(), "Finished loading mapping param.");
 
     last_timing_print_ = node_handle_->now();
-
-    // LADY_AND_COW dataset transforms
-    ref_transform_ << 1, 0, 0, 0,
-        0, 1, 0, 0,
-        0, 0, 1, 0,
-        0, 0, 0, 1;
-    T_B_C_ << 1, 0, 0, 0,
-        0, 1, 0, 0,
-        0, 0, 1, 0,
-        0, 0, 0, 1;
-    T_D_B_ << 0.971048, -0.120915, 0.206023, 0.00114049,
-        0.157010, 0.973037, -0.168959, 0.04509360,
-        -0.180038, 0.196415, 0.963850, 0.04307650,
-        0.0, 0.0, 0.0, 1.0;
 
     // TF2 buffer/listener
     if (!tf_buffer_)
@@ -161,15 +145,6 @@ void VDBMap::initialize()
     update_frontier_timer_ = node_handle_->create_wall_timer(
         std::chrono::duration<double>(FRONTIER_UPDATE_DURATION),
         std::bind(&VDBMap::update_frontier, this));
-
-    // lady_and_cow dataset subscriptions
-    lady_cow_cloud_sub_ = node_handle_->create_subscription<sensor_msgs::msg::PointCloud2>(
-        "/camera/depth_registered/points", rclcpp::SensorDataQoS(),
-        std::bind(&VDBMap::lady_cow_cloud_callback, this, std::placeholders::_1));
-
-    lady_cow_pose_sub_ = node_handle_->create_subscription<geometry_msgs::msg::TransformStamped>(
-        "/kinect/vrpn_client/estimated_transform", 10,
-        std::bind(&VDBMap::lady_cow_pose_callback, this, std::placeholders::_1));
 
     // General synced dataset via message_filters + tf2 MessageFilter
     cloud_sub_mf_.subscribe(node_handle_.get(), pcl_topic, rclcpp::SensorDataQoS().get_rmw_qos_profile());
@@ -269,6 +244,7 @@ void VDBMap::setup_parameters()
     node_handle_->declare_parameter<double>("max_update_dist", MAX_UPDATE_DIST);
     node_handle_->declare_parameter<double>("edt_update_duration", EDT_UPDATE_DURATION);
 
+    node_handle_->declare_parameter<int>("frontier_type", 0);
     node_handle_->declare_parameter<double>("frontier_update_duration", 2.0);
 
     node_handle_->declare_parameter<double>("vis_update_duration", VIS_UPDATE_DURATION);
@@ -344,6 +320,7 @@ bool VDBMap::load_mapping_para()
         }
     };
 
+    report_int("frontier_type", frontier_type_);
     report_double("l_free", L_FREE);
     report_double("l_occu", L_OCCU);
     report_double("l_max", L_MAX);
@@ -598,210 +575,6 @@ void VDBMap::cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     msg_ready_ = true;
 }
 
-void VDBMap::lady_cow_pose_callback(const geometry_msgs::msg::TransformStamped::ConstSharedPtr &pose)
-{
-    WriteLock wlock(pose_queue_lock);
-    pose_queue_.push(pose);
-    while (static_cast<int>(pose_queue_.size()) > kPoseQueueSize)
-    {
-        pose_queue_.pop();
-    }
-}
-
-void VDBMap::lady_cow_cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &cloud)
-{
-    {
-        WriteLock wlock(pose_queue_lock);
-        cloud_queue_.push(cloud);
-    }
-    sync_pose_and_cloud_fiesta();
-}
-
-bool VDBMap::sync_pose_and_cloud(geometry_msgs::msg::TransformStamped &latest_pose,
-                                 const sensor_msgs::msg::PointCloud2 &latest_cloud)
-{
-    // Time tolerance window: 3ms (ROS2-safe arithmetic).
-    const rclcpp::Duration tol = rclcpp::Duration::from_seconds(0.003);
-#ifdef ASYNC_SPINNER
-    std::this_thread::sleep_for(std::chrono::milliseconds(6));
-#endif
-
-    const rclcpp::Time cloud_time(latest_cloud.header.stamp);
-    std::vector<geometry_msgs::msg::TransformStamped::ConstSharedPtr> candidates;
-
-    {
-        // We will pop inspected elements; operate under lock.
-        WriteLock wlock(pose_queue_lock);
-        size_t check_count = pose_queue_.size();
-
-        while (check_count > 0)
-        {
-            auto pose_ptr = pose_queue_.front();
-            const rclcpp::Time pose_time(pose_ptr->header.stamp);
-
-            --check_count;
-            if ((cloud_time - pose_time) > tol)
-            {
-                // Pose is too old relative to cloud; discard it.
-                pose_queue_.pop();
-                continue;
-            }
-            else if ((pose_time - cloud_time) < tol)
-            {
-                // Pose is a bit ahead, still within tolerance; keep scanning.
-                // (No pop to retain for other clouds unless matched)
-                // This branch mirrors the original logic; nothing to do.
-            }
-            else
-            {
-                // Pose within [cloud - tol, cloud + tol]: candidate.
-                candidates.push_back(pose_ptr);
-                pose_queue_.pop();
-            }
-        }
-    }
-
-    if (candidates.empty())
-        return false;
-
-    // Pick the closest in |t_pose - t_cloud|.
-    long long best_cost = std::numeric_limits<long long>::max();
-    size_t best_idx = candidates.size();
-    for (size_t i = 0; i < candidates.size(); ++i)
-    {
-        const auto dt = rclcpp::Time(candidates[i]->header.stamp) - cloud_time;
-        const long long cost = std::llabs(dt.nanoseconds());
-        if (cost < best_cost)
-        {
-            best_cost = cost;
-            best_idx = i;
-        }
-    }
-    if (best_idx >= candidates.size())
-        return false;
-
-    latest_pose = *candidates[best_idx];
-    return true;
-}
-
-void VDBMap::sync_pose_and_cloud_fiesta()
-{
-    const rclcpp::Duration tol = rclcpp::Duration::from_seconds(0.003);
-
-    while (true)
-    {
-        // Peek current cloud.
-        sensor_msgs::msg::PointCloud2::ConstSharedPtr cloud_ptr;
-        {
-            WriteLock wlock(pose_queue_lock);
-            if (cloud_queue_.empty())
-                break;
-            cloud_ptr = cloud_queue_.front();
-        }
-
-        bool has_new_pose = false;
-        const rclcpp::Time cloud_time(cloud_ptr->header.stamp);
-
-        {
-            // Advance pose queue up to cloud_time + tol.
-            WriteLock wlock(pose_queue_lock);
-            while (pose_queue_.size() > 1 &&
-                   rclcpp::Time(pose_queue_.front()->header.stamp) <= (cloud_time + tol))
-            {
-                latest_pose_ = *pose_queue_.front();
-                pose_queue_.pop();
-                has_new_pose = true;
-            }
-
-            // If no candidate pose beyond this point, we cannot match this cloud yet.
-            if (pose_queue_.empty() ||
-                rclcpp::Time(pose_queue_.front()->header.stamp) <= (cloud_time + tol))
-            {
-                break;
-            }
-        }
-
-        if (!has_new_pose)
-        {
-            // No suitable pose for this cloud; drop it to keep up.
-            WriteLock wlock(pose_queue_lock);
-            cloud_queue_.pop();
-            continue;
-        }
-
-        // Mark available for EDT update after occupancy update
-        msg_ready_ = true;
-
-        // ----- Build current transform from latest_pose_ -----
-        ref_transform_ = cur_transform_;
-
-        const Eigen::Vector3d translation(
-            latest_pose_.transform.translation.x,
-            latest_pose_.transform.translation.y,
-            latest_pose_.transform.translation.z);
-        const Eigen::Quaterniond rotation(
-            latest_pose_.transform.rotation.w,
-            latest_pose_.transform.rotation.x,
-            latest_pose_.transform.rotation.y,
-            latest_pose_.transform.rotation.z);
-
-        cur_transform_.setIdentity();
-        cur_transform_.block<3, 3>(0, 0) = rotation.toRotationMatrix();
-        cur_transform_.block<3, 1>(0, 3) = translation;
-        cur_transform_ = cur_transform_ * T_D_B_ * T_B_C_;
-
-        // Convert to TransformStamped for tf2::doTransform
-        Eigen::Affine3d cur_eig_trans;
-        cur_eig_trans.matrix() = cur_transform_;
-        geometry_msgs::msg::TransformStamped cur_tf_msg = tf2::eigenToTransform(cur_eig_trans);
-        cur_tf_msg.header.frame_id = worldframeId;
-        cur_tf_msg.child_frame_id = robotframeId;
-        cur_tf_msg.header.stamp = cloud_ptr->header.stamp;
-
-        // Extract origin from transform
-        origin_ = Eigen::Vector3d(
-            cur_tf_msg.transform.translation.x,
-            cur_tf_msg.transform.translation.y,
-            cur_tf_msg.transform.translation.z);
-
-        // ----- Cloud transform & occupancy update -----
-        if (cloud_ptr->data.empty())
-        {
-            std::cout << "invalid point data!" << std::endl;
-            WriteLock wlock(pose_queue_lock);
-            cloud_queue_.pop();
-            continue;
-        }
-
-        sensor_msgs::msg::PointCloud2 cloud_world;
-        try
-        {
-            tf2::doTransform(*cloud_ptr, cloud_world, cur_tf_msg);
-        }
-        catch (const std::exception &e)
-        {
-            RCLCPP_ERROR(node_handle_->get_logger(), "doTransform failed: %s", e.what());
-            WriteLock wlock(pose_queue_lock);
-            cloud_queue_.pop();
-            continue;
-        }
-
-        auto xyz = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-        pcl::fromROSMsg(cloud_world, *xyz);
-
-        ++occu_update_count_;
-        std::cout << "Running " << occu_update_count_ << " updates." << std::endl;
-        timing::Timer update_OCC_timer("UpdateOccu");
-        this->update_occmap(grid_logocc_, origin_, xyz);
-        update_OCC_timer.Stop();
-        timing::Timing::Print(std::cout);
-
-        // Done with this cloud.
-        WriteLock wlock(pose_queue_lock);
-        cloud_queue_.pop();
-    }
-}
-
 ////////////////////////////////////////////////////////////////////////////////
 // Visualization
 
@@ -918,8 +691,7 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
         const double range = dir.length();
         // if (range <= 1e-6)
         //     {continue;}
-        double MIN_RANGE = 0.6;
-        if (range < MIN_RANGE)
+        if (range < START_RANGE)
         {
             continue;
         }
@@ -1024,79 +796,6 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
     }
 }
 
-// void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
-//                            const Eigen::Vector3d &origin,
-//                            std::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> xyz)
-// {
-//     std::unique_lock<std::shared_mutex> lk(map_mutex);
-//     auto grid_acc = grid_map->getAccessor();
-
-//     openvdb::Vec3d origin3d(origin.x(), origin.y(), origin.z());
-//     openvdb::Vec3d origin_ijk = grid_map->worldToIndex(origin3d);
-
-//     for (auto point = xyz->begin(); point != xyz->end(); ++point)
-//     {
-//         openvdb::Vec3d p_xyz(point->x, point->y, point->z);
-//         openvdb::Vec3d p_ijk = grid_map->worldToIndex(p_xyz);
-//         openvdb::Vec3d dir(p_ijk - origin_ijk);
-//         double range = dir.length();
-//         dir.normalize();
-
-//         // Note: real sensor range should strictly be larger than sensor_range
-//         bool truncated = false;
-//         openvdb::math::Ray<double> ray(origin_ijk, dir);
-//         openvdb::math::DDA<openvdb::math::Ray<double>, 0> dda(ray, 0.0, std::min(SENSOR_RANGE, range));
-
-//         // decrease occupancy
-//         do
-//         {
-//             openvdb::Coord ijk(dda.voxel());
-
-//             float ll_old = 0.0f;
-//             bool isKnown = grid_acc.probeValue(ijk, ll_old);
-//             float ll_new = std::max(static_cast<float>(L_MIN), ll_old + static_cast<float>(L_FREE));
-
-//             if (!isKnown)
-//             {
-//                 grid_distance_->dist_acc_->setValueOn(ijk);
-//             } // unknown -> free -> EDT initialize
-//             else if (ll_old >= 0.0f && ll_new < 0.0f)
-//             {
-//                 grid_distance_->removeObstacle(ijk);
-//             } // occupied -> free -> EDT RemoveObstacle
-
-//             grid_acc.setValueOn(ijk, ll_new);
-//             dda.step();
-
-//         } while (dda.time() < dda.maxTime());
-
-//         // increase occupancy
-//         if ((!truncated) && (range <= SENSOR_RANGE))
-//         {
-//             for (int i = 0; i < HIT_THICKNESS; ++i)
-//             {
-//                 openvdb::Coord ijk(dda.voxel());
-
-//                 float ll_old = 0.0f;
-//                 bool isKnown = grid_acc.probeValue(ijk, ll_old);
-//                 float ll_new = std::min(static_cast<float>(L_MAX), ll_old + static_cast<float>(L_OCCU));
-
-//                 if (!isKnown)
-//                 {
-//                     grid_distance_->dist_acc_->setValueOn(ijk);
-//                 } // unknown -> occupied -> EDT SetObstacle
-//                 else if (ll_old < 0.0f && ll_new >= 0.0f)
-//                 {
-//                     grid_distance_->setObstacle(ijk);
-//                 } // free -> occupied -> EDT SetObstacle
-
-//                 grid_acc.setValueOn(ijk, ll_new);
-//                 dda.step();
-//             }
-//         } // process obstacle
-//     } // end inserting
-// }
-
 ////////////////////////////////////////////////////////////////////////////////
 // Frontier Extraction
 void VDBMap::update_frontier()
@@ -1126,6 +825,23 @@ void VDBMap::update_frontier()
         update_box.expand(*c_it);
     }
 
+    using FrontierCheckFunc = bool (*)(const openvdb::FloatGrid::ConstAccessor &, const openvdb::Coord &, double);
+    FrontierCheckFunc check_func = nullptr;
+
+    switch (frontier_type_)
+    {
+    case 0:
+    default:
+        check_func = &VDBMap::check_frontier_6;
+        break;
+    case 1:
+        check_func = &VDBMap::check_surface_frontier_6;
+        break;
+    case 2:
+        check_func = &VDBMap::check_surface_frontier_26;
+        break;
+    }
+
     {
         std::shared_lock<std::shared_mutex> rlk(map_mutex);
         openvdb::FloatGrid::ConstAccessor occgrid_acc = grid_logocc_->getConstAccessor(); // read only
@@ -1139,9 +855,7 @@ void VDBMap::update_frontier()
                 continue;
             }
             const openvdb::Coord ijk = iter.getCoord();
-            if (!check_frontier_6(occgrid_acc, ijk))
-            // if (!check_surface_frontier_6(occgrid_acc, ijk))
-            // if (!check_surface_frontier_26(occgrid_acc, ijk))
+            if (!(*check_func)(occgrid_acc, ijk, L_THRESH))
             {
                 to_off.push_back(ijk);
             }
@@ -1156,9 +870,7 @@ void VDBMap::update_frontier()
             {
                 continue;
             }
-            if (check_frontier_6(occgrid_acc, ijk))
-            // if (check_surface_frontier_6(occgrid_acc, ijk))
-            // if (check_surface_frontier_26(occgrid_acc, ijk))
+            if ((*check_func)(occgrid_acc, ijk, L_THRESH))
             {
                 to_on.push_back(ijk);
             }
