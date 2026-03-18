@@ -101,8 +101,19 @@ public:
            const std::shared_ptr<tf2_ros::TransformListener> &external_tf_listener);
     ~VDBMap();
 
+    // Lookup logocc value: low freq
     bool query_log_odds_at_world(const Eigen::Vector3d &p_world, float &logodds_out) const;
     bool query_log_odds_at_index(const openvdb::Coord &ijk, float &logodds_out) const;
+    // high freq
+    bool query_log_odds_at_world(const Eigen::Vector3d &p_world, float &logodds_out, openvdb::FloatGrid::ConstAccessor &acc) const;
+    bool query_log_odds_at_index(const openvdb::Coord &ijk, float &logodds_out, openvdb::FloatGrid::ConstAccessor &acc) const;
+
+    // Lookup inflated value: low freq
+    bool query_is_inflated_at_world(const Eigen::Vector3d &p_world, int &inflate_val) const;
+    bool query_is_inflated_at_index(const openvdb::Coord &ijk, int &inflate_val) const;
+    // high freq
+    bool query_is_inflated_at_world(const Eigen::Vector3d &p_world, int &inflate_val, openvdb::Int32Grid::ConstAccessor &acc) const;
+    bool query_is_inflated_at_index(const openvdb::Coord &ijk, int &inflate_val, openvdb::Int32Grid::ConstAccessor &acc) const;
 
     bool query_sqdist_at_world(const Eigen::Vector3d &p_world, double &sqdist_out) const;
     bool query_sqdist_at_index(const openvdb::Coord &ijk, double &sqdist_out) const;
@@ -149,9 +160,19 @@ private:
 
     openvdb::math::Transform::Ptr grid_transform_;
 
+    // Module switch
+    bool enable_dist_map_;
+    bool enable_frontier_map_;
+    bool enable_frontier_cluster_;
+    bool enable_inflated_map_;
+
 public:
     std::string get_node_name() const;
     rclcpp::Node::SharedPtr get_node_handle() const;
+
+    std::shared_mutex &get_map_mutex() const;
+
+    openvdb::Int32Grid::ConstAccessor get_inflated_accessor() const;
 
     // read-write lock (C++17)
     using Lock = std::shared_mutex;
@@ -168,6 +189,8 @@ public:
     rclcpp::TimerBase::SharedPtr update_vis_timer_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr occu_vis_pub_;
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr slice_vis_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr inflated_vis_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr frontier_inflated_vis_pub_;
     // ROS2: rclcpp::Timer uses callback without TimerEvent by default.
     void visualize_maps();
 
@@ -230,6 +253,33 @@ private: // occupancy map
     void grid_message(const openvdb::FloatGrid::Ptr &grid,
                       sensor_msgs::msg::PointCloud2 &disp_msg);
 
+    // Inflated Map
+    openvdb::Int32Grid::Ptr grid_inflated_;
+    std::vector<openvdb::Coord> inflation_kernel_;
+    std::vector<openvdb::Coord> frontier_inflation_kernel_;
+
+    void build_inflation_kernel();
+    void apply_inflation(openvdb::Int32Grid::Accessor &inf_acc,
+                         const openvdb::Coord &center,
+                         int delta);
+    void apply_frontier_inflation(openvdb::Int32Grid::Accessor &inf_acc,
+                                  const openvdb::Coord &center,
+                                  int delta);
+
+    static constexpr int FRONTIER_INFLATION_DELTA = 100000;
+
+    enum class InflationChannel { ALL, OCC_ONLY, FRONTIER_ONLY };
+
+    void inflated_grid_to_pcl(openvdb::Int32Grid::ConstPtr grid,
+                              std::shared_ptr<pcl::PointCloud<pcl::PointXYZI>> &pc_out,
+                              InflationChannel channel = InflationChannel::ALL);
+    void inflated_grid_message(const openvdb::Int32Grid::Ptr &grid,
+                               sensor_msgs::msg::PointCloud2 &disp_msg,
+                               InflationChannel channel = InflationChannel::ALL);
+
+    double safe_robot_radius_xy_;
+    double safe_robot_height_z_;
+
 private: // distance map
     int max_coor_dist_;
     int max_coor_sqdist_;
@@ -278,8 +328,8 @@ private:
     int frontier_type_;
 
     static inline bool check_frontier_6(const openvdb::FloatGrid::ConstAccessor &acc,
-                                 const openvdb::Coord &ijk,
-                                 const double threshold)
+                                        const openvdb::Coord &ijk,
+                                        const double threshold)
     {
         const float occ_thresh = static_cast<float>(threshold);
         float v = 0.f;
@@ -304,8 +354,8 @@ private:
         return false;
     }
     static inline bool check_surface_frontier_6(const openvdb::FloatGrid::ConstAccessor &acc,
-                                         const openvdb::Coord &ijk,
-                                         const double threshold)
+                                                const openvdb::Coord &ijk,
+                                                const double threshold)
     {
         const float occ_thresh = static_cast<float>(threshold);
         float v = 0.f;
@@ -341,8 +391,8 @@ private:
     }
 
     static inline bool check_surface_frontier_26(const openvdb::FloatGrid::ConstAccessor &acc,
-                                          const openvdb::Coord &ijk,
-                                          const double threshold)
+                                                 const openvdb::Coord &ijk,
+                                                 const double threshold)
     {
         const float occ_thresh = static_cast<float>(threshold);
         float v = 0.f;
@@ -380,6 +430,7 @@ private:
 private: // pose correction for lady and cow dataset
     int occu_update_count_;
     int dist_update_count_;
+    int frontier_update_count_;
     Eigen::Matrix4d cur_transform_;
     Eigen::Matrix4d ref_transform_;
     Eigen::Matrix4d T_B_C_, T_D_B_;
