@@ -1191,11 +1191,11 @@ void VDBMap::update_frontier()
     }
 
     {
+        std::unique_lock<std::shared_mutex> lk(map_mutex);
         openvdb::BoolGrid::Accessor frontier_acc = grid_frontier_->getAccessor();
 
         if (enable_inflated_map_)
         {
-            std::unique_lock<std::shared_mutex> lk(map_mutex);
             openvdb::Int32Grid::Accessor inf_acc = grid_inflated_->getAccessor();
 
             for (const auto &ijk : to_off)

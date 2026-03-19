@@ -130,6 +130,8 @@ public:
 
     openvdb::math::Transform::ConstPtr get_grid_transform() const;
 
+    static constexpr int FRONTIER_INFLATION_DELTA = 100000;
+
 private:
     // General parameters
     std::string pcl_topic;
@@ -265,8 +267,6 @@ private: // occupancy map
     void apply_frontier_inflation(openvdb::Int32Grid::Accessor &inf_acc,
                                   const openvdb::Coord &center,
                                   int delta);
-
-    static constexpr int FRONTIER_INFLATION_DELTA = 100000;
 
     enum class InflationChannel { ALL, OCC_ONLY, FRONTIER_ONLY };
 
