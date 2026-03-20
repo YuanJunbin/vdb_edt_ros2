@@ -69,7 +69,7 @@ void DynamicVDBEDT::initialize(EDTGrid::Ptr& dist_map, float vox_size, int versi
     }
 }
 
-double DynamicVDBEDT::query_sq_distance(const openvdb::Coord &target)
+double DynamicVDBEDT::query_sq_distance(const openvdb::Coord &target) const
 {
     dataCell cell;
     bool known = dist_acc_->probeValue(target, cell);
@@ -79,7 +79,7 @@ double DynamicVDBEDT::query_sq_distance(const openvdb::Coord &target)
     return cell.dist();
 }
 
-double DynamicVDBEDT::query_sq_distance(const openvdb::Coord &target, openvdb::Coord &obst)
+double DynamicVDBEDT::query_sq_distance(const openvdb::Coord &target, openvdb::Coord &obst) const
 {
     dataCell cell;
     bool known = dist_acc_->probeValue(target, cell);
@@ -110,7 +110,10 @@ void DynamicVDBEDT::setObstacle(int x, int y, int z)
 
 void DynamicVDBEDT::setObstacle(openvdb::Coord& p) {
   dataCell c = dist_acc_->getValue(p);
-    if(c.occ()!=Occupied && c.status()!=Queued){
+    if(c.occ()!=Occupied){
+        if (c.status() != Queued) {
+            open_.push(0, p);
+        }
         c.obstX() = p.x();
         c.obstY() = p.y();
         c.obstZ() = p.z();
@@ -118,7 +121,6 @@ void DynamicVDBEDT::setObstacle(openvdb::Coord& p) {
         c.dist() = 0;
         c.radius() = notRaise; // -1
         c.status() = Queued;
-        open_.push(0, p);
         dist_acc_->setValueOn(p, c);
         obst_list_.push_back(p);
     }
@@ -132,7 +134,11 @@ void DynamicVDBEDT::removeObstacle(int x, int y, int z)
 
 void DynamicVDBEDT::removeObstacle(openvdb::Coord& p) {
     dataCell c = dist_acc_->getValue(p);
-    if(c.occ()==Occupied && c.status()!=Queued){
+    // if(c.occ()==Occupied && c.status()!=Queued)
+    if(c.occ()==Occupied)
+    {
+        if (c.status()!=Queued)
+            {open_.push(0, p);}
         c.obstX() = Empty;
         c.obstY() = Empty;
         c.obstZ() = Empty;
@@ -140,7 +146,6 @@ void DynamicVDBEDT::removeObstacle(openvdb::Coord& p) {
         c.dist() = maxSqDist_;
         c.radius() = needRaise; // 0
         c.status() = Queued;
-        open_.push(0, p);
         dist_acc_->setValueOn(p, c);
     }
 }
