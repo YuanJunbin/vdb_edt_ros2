@@ -309,11 +309,8 @@ private:
     std::mutex swap_lock;
 
     // visualization
-    rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr frontier_vis_pub;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr frontier_vis_pub;
     void vis_frontier();
-    void generate_frontier_marker(const openvdb::BoolGrid::Ptr &grid,
-                                  const std::string &frame_id,
-                                  visualization_msgs::msg::Marker &marker_msg);
     void frontier_to_pcl(openvdb::BoolGrid::ConstPtr grid,
                          std::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> &pc_out);
 

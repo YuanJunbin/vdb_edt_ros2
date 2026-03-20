@@ -109,7 +109,7 @@ void VDBMap::initialize()
     slice_vis_pub_ = node_handle_->create_publisher<visualization_msgs::msg::Marker>("/dist_slice", 5);
 
     inflated_vis_pub_ = node_handle_->create_publisher<sensor_msgs::msg::PointCloud2>("/inflated_grid", 5);
-    frontier_vis_pub = node_handle_->create_publisher<visualization_msgs::msg::Marker>("/frontier_vis", 5);
+    frontier_vis_pub = node_handle_->create_publisher<sensor_msgs::msg::PointCloud2>("/frontier_vis", 5);
 
     // OpenVDB init & grids
     openvdb::initialize();
@@ -681,11 +681,7 @@ void VDBMap::build_inflation_kernel()
         {
             for (int z = -rz; z <= rz; ++z)
             {
-                double dx = x * VOX_SIZE;
-                double dy = y * VOX_SIZE;
-                double dz = z * VOX_SIZE;
-
-                if ((dx * dx + dy * dy) <= (safe_robot_radius_xy_ * safe_robot_radius_xy_) && std::abs(dz) <= safe_robot_height_z_)
+                if (x * x + y * y <= rx * rx && std::abs(z) <= rz)
                 {
                     inflation_kernel_.push_back(openvdb::Coord(x, y, z));
                 }
@@ -693,12 +689,9 @@ void VDBMap::build_inflation_kernel()
         }
     }
 
-    double frontier_r_xy = std::max(0.0, safe_robot_radius_xy_ - VOX_SIZE);
-    double frontier_h_z = std::max(0.0, safe_robot_height_z_ - VOX_SIZE);
-
-    int frx = static_cast<int>(std::ceil(frontier_r_xy / VOX_SIZE));
-    int fry = frx;
-    int frz = static_cast<int>(std::ceil(frontier_h_z / VOX_SIZE));
+    int frx = std::max(0, rx - 1);
+    int fry = std::max(0, ry - 1);
+    int frz = std::max(0, rz - 1);
 
     frontier_inflation_kernel_.clear();
 
@@ -708,11 +701,7 @@ void VDBMap::build_inflation_kernel()
         {
             for (int z = -frz; z <= frz; ++z)
             {
-                double dx = x * VOX_SIZE;
-                double dy = y * VOX_SIZE;
-                double dz = z * VOX_SIZE;
-
-                if ((dx * dx + dy * dy) <= (frontier_r_xy * frontier_r_xy) && std::abs(dz) <= frontier_h_z)
+                if (x * x + y * y <= frx * frx && std::abs(z) <= frz)
                 {
                     frontier_inflation_kernel_.push_back(openvdb::Coord(x, y, z));
                 }
@@ -1251,9 +1240,20 @@ void VDBMap::update_frontier()
 // Frontier Visualization
 void VDBMap::vis_frontier()
 {
-    visualization_msgs::msg::Marker frontier_marker_msg;
-    generate_frontier_marker(grid_frontier_, worldframeId, frontier_marker_msg);
-    frontier_vis_pub->publish(frontier_marker_msg);
+    if (!frontier_vis_pub || frontier_vis_pub->get_subscription_count() == 0)
+    {
+        return;
+    }
+
+    std::shared_lock<std::shared_mutex> rlk(map_mutex);
+    auto pcl_cloud = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+    this->frontier_to_pcl(grid_frontier_, pcl_cloud);
+
+    sensor_msgs::msg::PointCloud2 msg;
+    pcl::toROSMsg(*pcl_cloud, msg);
+    msg.header.frame_id = worldframeId;
+    msg.header.stamp = node_handle_->now();
+    frontier_vis_pub->publish(msg);
 }
 
 void VDBMap::frontier_to_pcl(openvdb::BoolGrid::ConstPtr grid,
@@ -1337,56 +1337,6 @@ void VDBMap::vis_frontier_viewpoints()
     viewpoints_pub_->publish(pa);
 }
 
-void VDBMap::generate_frontier_marker(const openvdb::BoolGrid::Ptr &grid,
-                                      const std::string &frame_id,
-                                      visualization_msgs::msg::Marker &marker_msg)
-{
-    marker_msg.header.frame_id = frame_id;
-    marker_msg.header.stamp = node_handle_->now();
-    marker_msg.ns = "vdb_grid";
-    marker_msg.id = 0;
-    marker_msg.type = visualization_msgs::msg::Marker::CUBE_LIST;
-    marker_msg.action = visualization_msgs::msg::Marker::ADD;
-    marker_msg.pose.orientation.w = 1.0;
-    marker_msg.color.a = 1.0;
-    marker_msg.frame_locked = true;
-
-    double voxel_size = grid->voxelSize()[0];
-    marker_msg.scale.x = voxel_size;
-    marker_msg.scale.y = voxel_size;
-    marker_msg.scale.z = voxel_size;
-
-    openvdb::CoordBBox bbox = grid->evalActiveVoxelBoundingBox();
-
-    for (auto iter = grid->cbeginValueOn(); iter; ++iter)
-    {
-        if (!iter.getValue())
-        {
-            continue;
-        }
-
-        openvdb::Vec3d world = grid->indexToWorld(iter.getCoord());
-
-        geometry_msgs::msg::Point pt;
-        pt.x = world.x();
-        pt.y = world.y();
-        pt.z = world.z();
-
-        std_msgs::msg::ColorRGBA color;
-        color.r = 1.0;
-        color.g = 0.0;
-        color.b = 0.0;
-        color.a = 0.3;
-
-        marker_msg.points.push_back(pt);
-        marker_msg.colors.push_back(color);
-    }
-
-    if (marker_msg.points.empty())
-    {
-        marker_msg.action = visualization_msgs::msg::Marker::DELETE;
-    }
-}
 
 ////////////////////////////////////////////////////////////////////////////////
 // Slice visualization helpers
