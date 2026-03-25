@@ -131,6 +131,9 @@ public:
     bool ray_inflated_clear_index(const openvdb::Coord &c0,
                                   const openvdb::Coord &c1) const;
 
+    bool ray_all_inflated_clear_index(const openvdb::Coord &c0,
+                                      const openvdb::Coord &c1) const;
+
     openvdb::math::Transform::ConstPtr get_grid_transform() const;
 
     static constexpr int FRONTIER_INFLATION_DELTA = 100000;

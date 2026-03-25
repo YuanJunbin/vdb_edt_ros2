@@ -710,6 +710,51 @@ bool VDBMap::ray_inflated_clear_index(const openvdb::Coord &c0,
     return true;
 }
 
+bool VDBMap::ray_all_inflated_clear_index(const openvdb::Coord &c0,
+                                          const openvdb::Coord &c1) const
+{
+    if (!grid_inflated_)
+    {
+        return false;
+    }
+
+    const int dx = c1.x() - c0.x();
+    const int dy = c1.y() - c0.y();
+    const int dz = c1.z() - c0.z();
+
+    const int steps = std::max({std::abs(dx), std::abs(dy), std::abs(dz)});
+    if (steps == 0)
+    {
+        int val = 0;
+        bool active = query_is_inflated_at_index(c0, val);
+        return !(active && val > 0);
+    }
+
+    const double inv = 1.0 / steps;
+    const double sx = dx * inv;
+    const double sy = dy * inv;
+    const double sz = dz * inv;
+
+    std::shared_lock<std::shared_mutex> rlk(map_mutex);
+    openvdb::Int32Grid::ConstAccessor inf_acc = grid_inflated_->getConstAccessor();
+
+    for (int i = 0; i <= steps; ++i)
+    {
+        const openvdb::Coord vox(
+            c0.x() + static_cast<int>(std::round(sx * i)),
+            c0.y() + static_cast<int>(std::round(sy * i)),
+            c0.z() + static_cast<int>(std::round(sz * i)));
+
+        int inflate_val = 0;
+        bool is_inflated = query_is_inflated_at_index(vox, inflate_val, inf_acc);
+        if (is_inflated && inflate_val > 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
 // Inflation of occ voxel grid
 
 void VDBMap::build_inflation_kernel()
