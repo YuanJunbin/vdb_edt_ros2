@@ -424,6 +424,16 @@ openvdb::Int32Grid::ConstAccessor VDBMap::get_inflated_accessor() const
     return grid_inflated_->getConstAccessor();
 }
 
+openvdb::FloatGrid::ConstAccessor VDBMap::get_logocc_accessor() const
+{
+    if (!grid_logocc_)
+    {
+        RCLCPP_ERROR(node_handle_->get_logger(), "Logocc grid is not initialized! Cannot get accessor.");
+        throw std::runtime_error("Logocc grid is null.");
+    }
+    return grid_logocc_->getConstAccessor();
+}
+
 // Get value in grids
 bool VDBMap::query_log_odds_at_world(const Eigen::Vector3d &p_world, float &logodds_out) const
 {

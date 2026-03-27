@@ -181,6 +181,8 @@ public:
     std::shared_mutex &get_map_mutex() const;
 
     openvdb::Int32Grid::ConstAccessor get_inflated_accessor() const;
+    openvdb::FloatGrid::ConstAccessor get_logocc_accessor() const;
+    const std::vector<openvdb::Coord> &get_inflation_kernel() const { return inflation_kernel_; }
 
     // read-write lock (C++17)
     using Lock = std::shared_mutex;
