@@ -3,6 +3,9 @@ vdb_map:
     pcl_topic: "/robot_1/sensors/ouster/point_cloud"
     world_frame_id: "map"
     robot_frame_id: "base_link"
+    lidar_frame_id: "ouster"
+    ray_origin_frame_id: "ouster"
+    use_cloud_header_frame: true
     data_set: "default"
 
     l_free:  -0.13

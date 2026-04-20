@@ -63,6 +63,7 @@
 // #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
 
 // message_filters in ROS2
+#include <message_filters/simple_filter.h>
 #include <message_filters/subscriber.h>
 
 #include <sensor_msgs/msg/point_cloud2.hpp>
@@ -89,6 +90,19 @@
 
 // Prefer constexpr over macro for compile-time constants.
 static constexpr int kPoseQueueSize = 20;
+
+template <typename M>
+class PublicSimpleFilter : public message_filters::SimpleFilter<M>
+{
+public:
+    using Base = message_filters::SimpleFilter<M>;
+    using MConstPtr = typename Base::MConstPtr;
+
+    void add(const MConstPtr &msg)
+    {
+        this->signalMessage(msg);
+    }
+};
 
 class VDBMap
 {
@@ -137,7 +151,10 @@ private:
     std::string pcl_topic;
     std::string worldframeId;
     std::string robotframeId;
+    std::string lidarframeId;
+    std::string rayOriginFrameId;
     std::string dataset;
+    bool use_cloud_header_frame_;
 
     // Mapping parameters
     double L_FREE, L_OCCU, L_THRESH, L_MIN, L_MAX, VOX_SIZE;
@@ -199,9 +216,11 @@ public:
     // general dataset with tf and point cloud
     std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
     std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
-    message_filters::Subscriber<sensor_msgs::msg::PointCloud2> cloud_sub_mf_;
+    rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_sub_raw_;
+    PublicSimpleFilter<sensor_msgs::msg::PointCloud2> cloud_filter_input_;
     std::unique_ptr<tf2_ros::MessageFilter<sensor_msgs::msg::PointCloud2>> cloud_filter_;
 
+    void cloud_input_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &pc_msg);
     void cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &pc_msg);
 
     /*** specially designed for lady_and_cow dataset

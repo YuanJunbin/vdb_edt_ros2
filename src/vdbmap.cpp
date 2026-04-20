@@ -45,7 +45,7 @@ VDBMap::VDBMap()
       MAX_UPDATE_DIST(20.0), EDT_UPDATE_DURATION(0.5), VIS_UPDATE_DURATION(10.0),
       VIS_MAP_MINX(-200.0), VIS_MAP_MINY(-200.0), VIS_MAP_MINZ(-1.0),
       VIS_MAP_MAXX(+200.0), VIS_MAP_MAXY(+200.0), VIS_MAP_MAXZ(10.0), VIS_SLICE_LEVEL(2.0),
-      msg_ready_(false), occu_update_count_(0), dist_update_count_(0), frontier_update_count_(0)
+      use_cloud_header_frame_(true), msg_ready_(false), occu_update_count_(0), dist_update_count_(0), frontier_update_count_(0)
 {
     node_handle_ = std::make_shared<rclcpp::Node>("vdb_map_node");
     node_name_ = get_node_name();
@@ -58,7 +58,7 @@ VDBMap::VDBMap(const rclcpp::Node::SharedPtr &external_node)
       MAX_UPDATE_DIST(20.0), EDT_UPDATE_DURATION(0.5), VIS_UPDATE_DURATION(10.0),
       VIS_MAP_MINX(-200.0), VIS_MAP_MINY(-200.0), VIS_MAP_MINZ(-1.0),
       VIS_MAP_MAXX(+200.0), VIS_MAP_MAXY(+200.0), VIS_MAP_MAXZ(10.0), VIS_SLICE_LEVEL(2.0),
-      msg_ready_(false), occu_update_count_(0), dist_update_count_(0), frontier_update_count_(0)
+      use_cloud_header_frame_(true), msg_ready_(false), occu_update_count_(0), dist_update_count_(0), frontier_update_count_(0)
 {
     node_handle_ = external_node;
     node_name_ = get_node_name();
@@ -73,7 +73,7 @@ VDBMap::VDBMap(const rclcpp::Node::SharedPtr &external_node,
       MAX_UPDATE_DIST(20.0), EDT_UPDATE_DURATION(0.5), VIS_UPDATE_DURATION(10.0),
       VIS_MAP_MINX(-200.0), VIS_MAP_MINY(-200.0), VIS_MAP_MINZ(-1.0),
       VIS_MAP_MAXX(+200.0), VIS_MAP_MAXY(+200.0), VIS_MAP_MAXZ(10.0), VIS_SLICE_LEVEL(2.0),
-      msg_ready_(false), occu_update_count_(0), dist_update_count_(0), frontier_update_count_(0)
+      use_cloud_header_frame_(true), msg_ready_(false), occu_update_count_(0), dist_update_count_(0), frontier_update_count_(0)
 {
     node_handle_ = external_node;
     tf_buffer_ = external_tf_buffer;
@@ -163,10 +163,14 @@ void VDBMap::initialize()
         std::chrono::duration<double>(VIS_UPDATE_DURATION),
         std::bind(&VDBMap::visualize_maps, this));
 
-    // General synced dataset via message_filters + tf2 MessageFilter
-    cloud_sub_mf_.subscribe(node_handle_.get(), pcl_topic, rclcpp::SensorDataQoS().get_rmw_qos_profile());
+    cloud_sub_raw_ = node_handle_->create_subscription<sensor_msgs::msg::PointCloud2>(
+        pcl_topic,
+        rclcpp::SensorDataQoS(),
+        std::bind(&VDBMap::cloud_input_callback, this, std::placeholders::_1));
+
     cloud_filter_ = std::make_unique<tf2_ros::MessageFilter<sensor_msgs::msg::PointCloud2>>(
-        cloud_sub_mf_, *tf_buffer_, worldframeId, 10, node_handle_);
+        cloud_filter_input_, *tf_buffer_, worldframeId, 20, node_handle_);
+    cloud_filter_->setTargetFrames({worldframeId, rayOriginFrameId});
     cloud_filter_->registerCallback(std::bind(&VDBMap::cloud_callback, this, std::placeholders::_1));
 
     RCLCPP_INFO(node_handle_->get_logger(), "[%s] VDBMap initialized.", node_name_.c_str());
@@ -180,6 +184,7 @@ void VDBMap::initialize()
 
 VDBMap::~VDBMap()
 {
+    cloud_sub_raw_.reset();
     cloud_filter_.reset();
     tf_listener_.reset();
     tf_buffer_.reset();
@@ -248,6 +253,8 @@ void VDBMap::setup_parameters()
     node_handle_->declare_parameter<std::string>("world_frame_id", "map");
     node_handle_->declare_parameter<std::string>("robot_frame_id", "base_link");
     node_handle_->declare_parameter<std::string>("lidar_frame_id", "ouster");
+    node_handle_->declare_parameter<std::string>("ray_origin_frame_id", "");
+    node_handle_->declare_parameter<bool>("use_cloud_header_frame", true);
     node_handle_->declare_parameter<std::string>("data_set", "shimizu");
 
     node_handle_->declare_parameter<double>("l_free", L_FREE);
@@ -317,6 +324,40 @@ bool VDBMap::load_mapping_para()
     {
         RCLCPP_ERROR(log, "Please set input robot frame id before running the node.");
         return false;
+    }
+
+    if (node_handle_->get_parameter("lidar_frame_id", lidarframeId))
+    {
+        RCLCPP_INFO(log, "Parameter lidar_frame_id set to: %s", lidarframeId.c_str());
+    }
+    else
+    {
+        RCLCPP_ERROR(log, "Please set input lidar frame id before running the node.");
+        return false;
+    }
+
+    rayOriginFrameId.clear();
+    if (node_handle_->get_parameter("ray_origin_frame_id", rayOriginFrameId) &&
+        !rayOriginFrameId.empty())
+    {
+        RCLCPP_INFO(log, "Parameter ray_origin_frame_id set to: %s", rayOriginFrameId.c_str());
+    }
+    else
+    {
+        rayOriginFrameId = lidarframeId;
+        RCLCPP_INFO(log, "Parameter ray_origin_frame_id not set. Falling back to lidar_frame_id: %s",
+                    rayOriginFrameId.c_str());
+    }
+
+    if (node_handle_->get_parameter("use_cloud_header_frame", use_cloud_header_frame_))
+    {
+        RCLCPP_INFO(log, "Parameter use_cloud_header_frame set to: %s",
+                    use_cloud_header_frame_ ? "true" : "false");
+    }
+    else
+    {
+        RCLCPP_WARN(log, "Using default use_cloud_header_frame: %s",
+                    use_cloud_header_frame_ ? "true" : "false");
     }
 
     std::string dataset_name;
@@ -757,15 +798,47 @@ inline void VDBMap::apply_frontier_inflation(openvdb::Int32Grid::Accessor &inf_a
 ////////////////////////////////////////////////////////////////////////////////
 // Callbacks
 
+void VDBMap::cloud_input_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &pc_msg)
+{
+    if (use_cloud_header_frame_)
+    {
+        cloud_filter_input_.add(pc_msg);
+        return;
+    }
+
+    auto normalized_msg = std::make_shared<sensor_msgs::msg::PointCloud2>(*pc_msg);
+    normalized_msg->header.frame_id = lidarframeId;
+    cloud_filter_input_.add(normalized_msg);
+}
+
 void VDBMap::cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr &pc_msg)
 {
-    // TF2: MessageFilter ensures transform availability, but still catch exceptions
-    geometry_msgs::msg::TransformStamped transform;
+    const std::string cloud_frame_id =
+        use_cloud_header_frame_ ? pc_msg->header.frame_id : lidarframeId;
+
+    if (cloud_frame_id.empty())
+    {
+        RCLCPP_ERROR(node_handle_->get_logger(), "Input cloud frame is empty.");
+        return;
+    }
+
+    geometry_msgs::msg::TransformStamped cloud_transform;
+    geometry_msgs::msg::TransformStamped origin_transform;
     try
     {
-        transform = tf_buffer_->lookupTransform(worldframeId,
-                                                pc_msg->header.frame_id,
-                                                pc_msg->header.stamp);
+        cloud_transform = tf_buffer_->lookupTransform(worldframeId,
+                                                      cloud_frame_id,
+                                                      pc_msg->header.stamp);
+        if (cloud_frame_id == rayOriginFrameId)
+        {
+            origin_transform = cloud_transform;
+        }
+        else
+        {
+            origin_transform = tf_buffer_->lookupTransform(worldframeId,
+                                                           rayOriginFrameId,
+                                                           pc_msg->header.stamp);
+        }
     }
     catch (const tf2::TransformException &ex)
     {
@@ -777,7 +850,7 @@ void VDBMap::cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     sensor_msgs::msg::PointCloud2 pc_world;
     try
     {
-        tf2::doTransform(*pc_msg, pc_world, transform);
+        tf2::doTransform(*pc_msg, pc_world, cloud_transform);
     }
     catch (const std::exception &e)
     {
@@ -785,11 +858,11 @@ void VDBMap::cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
         return;
     }
 
-    // Extract origin from transform
+    // Ray origin always comes from the configured lidar frame, even if the points are already in map/world.
     origin_ = Eigen::Vector3d(
-        transform.transform.translation.x,
-        transform.transform.translation.y,
-        transform.transform.translation.z);
+        origin_transform.transform.translation.x,
+        origin_transform.transform.translation.y,
+        origin_transform.transform.translation.z);
 
     // Convert to PCL XYZ
     auto xyz = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
