@@ -200,6 +200,10 @@ public:
     openvdb::Int32Grid::ConstAccessor get_inflated_accessor() const;
     openvdb::FloatGrid::ConstAccessor get_logocc_accessor() const;
     const std::vector<openvdb::Coord> &get_inflation_kernel() const { return inflation_kernel_; }
+    void extractInflatedPointsInBox(const openvdb::CoordBBox &bbox,
+                                    std::vector<Eigen::Vector3d> &points_out) const;
+    void extractInflatedSurfacePointsInBox(const openvdb::CoordBBox &bbox,
+                                           std::vector<Eigen::Vector3d> &points_out) const;
 
     // read-write lock (C++17)
     using Lock = std::shared_mutex;
@@ -348,7 +352,8 @@ private:
 
     // 0: check_frontier_6
     // 1: check_surface_frontier_6
-    // 2: check_surface_frontier_26 (default)
+    // 2: check_surface_frontier_26
+    // 3: check_frontier_26
     int frontier_type_;
 
     static inline bool check_frontier_6(const openvdb::FloatGrid::ConstAccessor &acc,
@@ -446,6 +451,32 @@ private:
             if (has_unknown_neighbor && has_occ_neighbor)
             {
                 return true;
+            }
+        }
+        return false;
+    }
+
+    static inline bool check_frontier_26(const openvdb::FloatGrid::ConstAccessor &acc,
+                                         const openvdb::Coord &ijk,
+                                         const double threshold)
+    {
+        const float occ_thresh = static_cast<float>(threshold);
+        float v = 0.f;
+        if (!(acc.probeValue(ijk, v) && v < occ_thresh))
+        {
+            return false;
+        }
+
+        static const int d26[26][3] = {{-1, -1, -1}, {-1, -1, 0}, {-1, -1, 1}, {-1, 0, -1}, {-1, 0, 0}, {-1, 0, 1}, {-1, 1, -1}, {-1, 1, 0}, {-1, 1, 1}, {0, -1, -1}, {0, -1, 0}, {0, -1, 1}, {0, 0, -1}, {0, 0, 1}, {0, 1, -1}, {0, 1, 0}, {0, 1, 1}, {1, -1, -1}, {1, -1, 0}, {1, -1, 1}, {1, 0, -1}, {1, 0, 0}, {1, 0, 1}, {1, 1, -1}, {1, 1, 0}, {1, 1, 1}};
+
+        // if any 26-neighbor is unknown -> frontier
+        for (int i = 0; i < 26; ++i)
+        {
+            const openvdb::Coord n = ijk.offsetBy(d26[i][0], d26[i][1], d26[i][2]);
+            float nv;
+            if (!acc.probeValue(n, nv))
+            {
+                return true; // unknown neighbor
             }
         }
         return false;

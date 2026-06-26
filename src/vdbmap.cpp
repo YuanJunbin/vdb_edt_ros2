@@ -271,7 +271,7 @@ void VDBMap::setup_parameters()
     node_handle_->declare_parameter<double>("max_update_dist", MAX_UPDATE_DIST);
     node_handle_->declare_parameter<double>("edt_update_duration", EDT_UPDATE_DURATION);
 
-    node_handle_->declare_parameter<int>("frontier_type", 0);
+    node_handle_->declare_parameter<int>("frontier_type", 3);
     node_handle_->declare_parameter<double>("frontier_update_duration", 2.0);
 
     node_handle_->declare_parameter<double>("vis_update_duration", VIS_UPDATE_DURATION);
@@ -463,6 +463,114 @@ openvdb::Int32Grid::ConstAccessor VDBMap::get_inflated_accessor() const
         throw std::runtime_error("Inflated grid is null.");
     }
     return grid_inflated_->getConstAccessor();
+}
+
+void VDBMap::extractInflatedPointsInBox(const openvdb::CoordBBox &bbox,
+                                        std::vector<Eigen::Vector3d> &points_out) const
+{
+    points_out.clear();
+
+    if (!grid_inflated_)
+    {
+        return;
+    }
+
+    std::shared_lock<std::shared_mutex> rlk(map_mutex);
+
+    using value_type = openvdb::Int32Grid::ValueType;
+    using itr_type = openvdb::Int32Grid::ValueOnCIter;
+
+    const openvdb::math::Transform &grid_tf(grid_inflated_->transform());
+
+    for (itr_type itr = grid_inflated_->cbeginValueOn(); itr.test(); ++itr)
+    {
+        if (!itr.isVoxelValue())
+        {
+            continue;
+        }
+
+        const openvdb::Coord ijk = itr.getCoord();
+        if (!bbox.isInside(ijk))
+        {
+            continue;
+        }
+
+        const value_type val = itr.getValue();
+        if (val <= 0)
+        {
+            continue;
+        }
+
+        const openvdb::Vec3d p = grid_tf.indexToWorld(ijk);
+        points_out.emplace_back(p.x(), p.y(), p.z());
+    }
+}
+
+void VDBMap::extractInflatedSurfacePointsInBox(const openvdb::CoordBBox &bbox,
+                                               std::vector<Eigen::Vector3d> &points_out) const
+{
+    points_out.clear();
+
+    if (!grid_inflated_)
+    {
+        return;
+    }
+
+    std::shared_lock<std::shared_mutex> rlk(map_mutex);
+
+    using value_type = openvdb::Int32Grid::ValueType;
+    using itr_type = openvdb::Int32Grid::ValueOnCIter;
+
+    const openvdb::math::Transform &grid_tf(grid_inflated_->transform());
+    const openvdb::Int32Grid::ConstAccessor acc = grid_inflated_->getConstAccessor();
+
+    static const openvdb::Coord kNbr6[6] = {
+        openvdb::Coord(1, 0, 0),
+        openvdb::Coord(-1, 0, 0),
+        openvdb::Coord(0, 1, 0),
+        openvdb::Coord(0, -1, 0),
+        openvdb::Coord(0, 0, 1),
+        openvdb::Coord(0, 0, -1)};
+
+    for (itr_type itr = grid_inflated_->cbeginValueOn(); itr.test(); ++itr)
+    {
+        if (!itr.isVoxelValue())
+        {
+            continue;
+        }
+
+        const openvdb::Coord ijk = itr.getCoord();
+        if (!bbox.isInside(ijk))
+        {
+            continue;
+        }
+
+        const value_type val = itr.getValue();
+        if (val <= 0)
+        {
+            continue;
+        }
+
+        bool is_surface = false;
+        for (const auto &delta : kNbr6)
+        {
+            const openvdb::Coord nbr = ijk + delta;
+            value_type nbr_val = 0;
+            if (!acc.probeValue(nbr, nbr_val) || nbr_val <= 0)
+            {
+                is_surface = true;
+                break;
+            }
+        }
+
+        if (!is_surface)
+        {
+            continue;
+        }
+
+        const openvdb::Vec3d p = grid_tf.indexToWorld(ijk);
+        points_out.emplace_back(p.x(), p.y(), p.z());
+    }
 }
 
 openvdb::FloatGrid::ConstAccessor VDBMap::get_logocc_accessor() const
@@ -980,8 +1088,8 @@ void VDBMap::cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     const auto now = node_handle_->now();
     if ((now - last_timing_print_).seconds() >= 1.0)
     {
-        RCLCPP_INFO(node_handle_->get_logger(), "%s",
-                    timing::Timing::Print().c_str());
+        RCLCPP_DEBUG(node_handle_->get_logger(), "%s",
+                     timing::Timing::Print().c_str());
         last_timing_print_ = now;
     }
     msg_ready_ = true;
@@ -1085,14 +1193,18 @@ void VDBMap::update_edtmap()
 
     // update float occupancy map
     dist_update_count_++;
-    std::cout << "Running " << dist_update_count_ << " updates." << std::endl;
+    RCLCPP_DEBUG(node_handle_->get_logger(),
+                 "Running %d updates.", dist_update_count_);
     timing::Timer update_DIST_timer("UpdateDIST");
     this->grid_distance_->update();
     update_DIST_timer.Stop();
-    timing::Timing::Print(std::cout);
-    std::cout << "changed: " << grid_distance_->sum_occ_changed
-              << " raised: " << grid_distance_->sum_raised_num
-              << " lowered: " << grid_distance_->sum_lowered_num << std::endl;
+    RCLCPP_DEBUG(node_handle_->get_logger(), "%s",
+                 timing::Timing::Print().c_str());
+    RCLCPP_DEBUG(node_handle_->get_logger(),
+                 "changed: %d raised: %d lowered: %d",
+                 grid_distance_->sum_occ_changed,
+                 grid_distance_->sum_raised_num,
+                 grid_distance_->sum_lowered_num);
     msg_ready_ = false;
 }
 
@@ -1283,7 +1395,8 @@ void VDBMap::update_frontier()
     }
 
     frontier_update_count_++;
-    std::cout << "Running " << frontier_update_count_ << " frontier updates." << std::endl;
+    RCLCPP_DEBUG(node_handle_->get_logger(),
+                 "Running %d frontier updates.", frontier_update_count_);
     timing::Timer update_FRONTIER_timer("UpdateFrontier");
 
     auto c_it = snap.begin();
@@ -1308,6 +1421,9 @@ void VDBMap::update_frontier()
         break;
     case 2:
         check_func = &VDBMap::check_surface_frontier_26;
+        break;
+    case 3:
+        check_func = &VDBMap::check_frontier_26;
         break;
     }
 
@@ -1404,7 +1520,8 @@ void VDBMap::update_frontier()
     }
 
     update_FRONTIER_timer.Stop();
-    timing::Timing::Print(std::cout);
+    RCLCPP_DEBUG(node_handle_->get_logger(), "%s",
+                 timing::Timing::Print().c_str());
 
     vis_frontier();
 }
