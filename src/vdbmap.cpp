@@ -918,6 +918,24 @@ bool VDBMap::ray_all_inflated_clear_index(const openvdb::Coord &c0,
 
 void VDBMap::build_inflation_kernel()
 {
+    // Axis-aligned (box / Chebyshev) safety kernel. This is a deliberate
+    // conservative over-approximation of the physical (cylindrical) body
+    // footprint. The box is chosen so the discrete frontier-inflation identity
+    //
+    //     R_frontier (+) N26  ==  R_occ                                    (*)
+    //
+    // holds EXACTLY, where N26 is the full 3x3x3 (Chebyshev unit) neighborhood
+    // used for frontier detection and R_frontier is R_occ shrunk by one voxel
+    // per axis. Under (*), membership in the frontier-inflation channel is
+    // strictly equivalent to "the safety kernel around this voxel intersects
+    // unknown space" (Phi+ <=> IR(v) ∩ U != empty), with no over-cover
+    // "ghost" voxels. A cylindrical kernel breaks (*) at the diagonal
+    // (a box-1 disc (+) N26 != disc), producing frontier-inflated voxels whose
+    // kernel actually contains no unknown -- exactly the artifacts that must be
+    // avoided for the certified-clear / hitpoint logic to stay consistent.
+    //
+    // NOTE: the exact identity (*) assumes rx, ry, rz >= 1.
+
     int rx = static_cast<int>(std::ceil(safe_robot_radius_xy_ / VOX_SIZE));
     int ry = rx;
     int rz = static_cast<int>(std::ceil(safe_robot_height_z_ / VOX_SIZE));
@@ -930,14 +948,14 @@ void VDBMap::build_inflation_kernel()
         {
             for (int z = -rz; z <= rz; ++z)
             {
-                if (x * x + y * y <= rx * rx && std::abs(z) <= rz)
-                {
-                    inflation_kernel_.push_back(openvdb::Coord(x, y, z));
-                }
+                inflation_kernel_.push_back(openvdb::Coord(x, y, z));
             }
         }
     }
 
+    // Frontier voxels are already known-free, so the frontier-inflation kernel
+    // is the occupied kernel eroded by one voxel per axis (box-shaped). With
+    // N26-connected frontier detection this satisfies (*) exactly.
     int frx = std::max(0, rx - 1);
     int fry = std::max(0, ry - 1);
     int frz = std::max(0, rz - 1);
@@ -950,10 +968,7 @@ void VDBMap::build_inflation_kernel()
         {
             for (int z = -frz; z <= frz; ++z)
             {
-                if (x * x + y * y <= frx * frx && std::abs(z) <= frz)
-                {
-                    frontier_inflation_kernel_.push_back(openvdb::Coord(x, y, z));
-                }
+                frontier_inflation_kernel_.push_back(openvdb::Coord(x, y, z));
             }
         }
     }
