@@ -38,6 +38,7 @@
 #include <iostream>
 #include <memory>
 #include <limits>
+#include <cstdint>
 #include <unordered_set>
 
 // C++17 locks (replace boost::shared_mutex)
@@ -167,6 +168,49 @@ private:
     double START_RANGE, SENSOR_RANGE;
     int HIT_THICKNESS;
 
+    // Optional synthetic free-space rays for lidar return gaps. The wall is a
+    // sensor-aligned plane whose cells act as angular bins; cells hit by the
+    // current registered scan are excluded from synthetic ray casting.
+    struct SyntheticWallCell
+    {
+        double lateral;
+        double vertical;
+    };
+
+    bool synthetic_free_enable_ = false;
+    bool synthetic_free_log_stats_ = true;
+    int synthetic_free_update_stride_ = 1;
+    double synthetic_free_horizontal_half_fov_ = 0.5235987755982988;
+    double synthetic_free_wall_cell_size_ = 0.1;
+    // <= 0 preserves legacy behavior by falling back to sensor_range.
+    double synthetic_free_carve_range_ = -1.0;
+    double synthetic_free_wall_range_margin_ = 1.0;
+
+    // Shared with the planner's FOV model. Translation is declared here so
+    // both modules consume one parameter set; ray origin still comes from
+    // ray_origin_frame_id, so only the fixed sensor rotation is used below.
+    double body_sensor_x_ = 0.1;
+    double body_sensor_y_ = 0.0;
+    double body_sensor_z_ = 0.0;
+    double body_sensor_roll_ = 0.0;
+    double body_sensor_pitch_ = 0.0;
+    double body_sensor_yaw_ = 0.0;
+    double fov_theta_u_ = 0.3;
+    double fov_theta_d_ = -0.3;
+
+    double sensor_range_m_ = 5.0;
+    double synthetic_carve_range_m_ = 5.0;
+    double synthetic_carve_range_ijk_ = 25.0;
+    double synthetic_wall_range_m_ = 6.0;
+    double synthetic_wall_lateral_min_ = 0.0;
+    double synthetic_wall_lateral_max_ = 0.0;
+    double synthetic_wall_vertical_min_ = 0.0;
+    double synthetic_wall_vertical_max_ = 0.0;
+    std::size_t synthetic_wall_cols_ = 0;
+    std::size_t synthetic_wall_rows_ = 0;
+    std::vector<SyntheticWallCell> synthetic_wall_cells_;
+    std::uint64_t synthetic_free_update_sequence_ = 0;
+
     // VDB map
     int VERSION;
     double MAX_UPDATE_DIST;
@@ -222,6 +266,8 @@ public:
     rclcpp::Publisher<visualization_msgs::msg::Marker>::SharedPtr slice_vis_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr inflated_vis_pub_;
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr frontier_inflated_vis_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr synthetic_wall_unmasked_pub_;
+    rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr synthetic_wall_remaining_pub_;
     // ROS2: rclcpp::Timer uses callback without TimerEvent by default.
     void visualize_maps();
 
@@ -269,6 +315,7 @@ private:
 
 private: // occupancy map
     void initialize();
+    void initialize_synthetic_wall();
     mutable std::shared_mutex map_mutex;
 
     openvdb::FloatGrid::Ptr grid_logocc_;
@@ -277,7 +324,9 @@ private: // occupancy map
     void set_voxel_size(openvdb::GridBase &grid, double vs);
     void update_occmap(openvdb::FloatGrid::Ptr grid_map,
                        const Eigen::Vector3d &origin,
-                       std::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> xyz);
+                       std::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> xyz,
+                       bool run_synthetic_free,
+                       double body_yaw);
 
     // visualization
     void grid_to_pcl(openvdb::FloatGrid::ConstPtr grid,

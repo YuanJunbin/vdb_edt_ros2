@@ -31,9 +31,11 @@
 
 #include "vdb_edt/vdbmap.h"
 #include <cmath>
+#include <chrono>
 // NOTE(ROS2): Needed for tf2::doTransform on sensor_msgs::msg::PointCloud2
 #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
 #include <tf2_ros/create_timer_ros.h>
+#include <tf2/LinearMath/Matrix3x3.h>
 
 #include <unordered_map>
 #include <algorithm>
@@ -110,6 +112,12 @@ void VDBMap::initialize()
 
     inflated_vis_pub_ = node_handle_->create_publisher<sensor_msgs::msg::PointCloud2>("/inflated_grid", 5);
     frontier_vis_pub = node_handle_->create_publisher<sensor_msgs::msg::PointCloud2>("/frontier_vis", 5);
+    synthetic_wall_unmasked_pub_ =
+        node_handle_->create_publisher<sensor_msgs::msg::PointCloud2>(
+            "/synthetic_free_wall_unmasked", 1);
+    synthetic_wall_remaining_pub_ =
+        node_handle_->create_publisher<sensor_msgs::msg::PointCloud2>(
+            "/synthetic_free_wall_remaining", 1);
 
     // OpenVDB init & grids
     openvdb::initialize();
@@ -147,6 +155,10 @@ void VDBMap::initialize()
                                                                  std::bind(&VDBMap::update_frontier, this));
     }
 
+    // Keep the metric range for constructing and projecting the synthetic wall.
+    sensor_range_m_ = SENSOR_RANGE;
+    initialize_synthetic_wall();
+
     // Convert SENSOR_RANGE / START_RANGE from world (m) to index (voxels)
     {
         openvdb::Vec3d max_sense_dist(SENSOR_RANGE);
@@ -180,6 +192,123 @@ void VDBMap::initialize()
     {
         initialize_frontier_manager();
     }
+}
+
+void VDBMap::initialize_synthetic_wall()
+{
+    synthetic_wall_cells_.clear();
+    synthetic_wall_cols_ = 0;
+    synthetic_wall_rows_ = 0;
+
+    if (!synthetic_free_enable_)
+    {
+        return;
+    }
+
+    constexpr double kHalfPi = 1.5707963267948966;
+    constexpr std::size_t kMaxWallCells = 1000000;
+
+    if (!std::isfinite(synthetic_free_carve_range_))
+    {
+        synthetic_free_enable_ = false;
+        return;
+    }
+
+    synthetic_carve_range_m_ =
+        (synthetic_free_carve_range_ > 0.0)
+            ? synthetic_free_carve_range_
+            : sensor_range_m_;
+
+    const bool valid =
+        std::isfinite(sensor_range_m_) && sensor_range_m_ > 0.0 &&
+        std::isfinite(synthetic_carve_range_m_) &&
+        synthetic_carve_range_m_ > 0.0 &&
+        synthetic_carve_range_m_ <= sensor_range_m_ &&
+        std::isfinite(synthetic_free_wall_range_margin_) &&
+        synthetic_free_wall_range_margin_ >= 0.0 &&
+        std::isfinite(synthetic_free_wall_cell_size_) &&
+        synthetic_free_wall_cell_size_ > 0.0 &&
+        std::isfinite(synthetic_free_horizontal_half_fov_) &&
+        synthetic_free_horizontal_half_fov_ > 0.0 &&
+        synthetic_free_horizontal_half_fov_ < kHalfPi &&
+        std::isfinite(body_sensor_roll_) &&
+        std::isfinite(body_sensor_pitch_) &&
+        std::isfinite(body_sensor_yaw_) &&
+        std::isfinite(fov_theta_d_) && std::isfinite(fov_theta_u_) &&
+        fov_theta_d_ < fov_theta_u_ &&
+        fov_theta_d_ > -kHalfPi && fov_theta_u_ < kHalfPi;
+
+    if (!valid)
+    {
+        synthetic_free_enable_ = false;
+        return;
+    }
+
+    synthetic_wall_range_m_ =
+        synthetic_carve_range_m_ + synthetic_free_wall_range_margin_;
+    const openvdb::Vec3d carve_range_ijk = grid_logocc_->worldToIndex(
+        openvdb::Vec3d(synthetic_carve_range_m_));
+    synthetic_carve_range_ijk_ = carve_range_ijk.x();
+    if (!std::isfinite(synthetic_carve_range_ijk_) ||
+        synthetic_carve_range_ijk_ <= 0.0)
+    {
+        synthetic_free_enable_ = false;
+        return;
+    }
+
+    synthetic_wall_lateral_min_ =
+        -synthetic_wall_range_m_ * std::tan(synthetic_free_horizontal_half_fov_);
+    synthetic_wall_lateral_max_ = -synthetic_wall_lateral_min_;
+    synthetic_wall_vertical_min_ =
+        synthetic_wall_range_m_ * std::tan(fov_theta_d_);
+    synthetic_wall_vertical_max_ =
+        synthetic_wall_range_m_ * std::tan(fov_theta_u_);
+
+    const double lateral_span =
+        synthetic_wall_lateral_max_ - synthetic_wall_lateral_min_;
+    const double vertical_span =
+        synthetic_wall_vertical_max_ - synthetic_wall_vertical_min_;
+    const double cols_d = std::ceil(lateral_span / synthetic_free_wall_cell_size_);
+    const double rows_d = std::ceil(vertical_span / synthetic_free_wall_cell_size_);
+
+    if (!std::isfinite(cols_d) || !std::isfinite(rows_d) ||
+        cols_d < 1.0 || rows_d < 1.0 ||
+        cols_d > static_cast<double>(kMaxWallCells) ||
+        rows_d > static_cast<double>(kMaxWallCells))
+    {
+        synthetic_free_enable_ = false;
+        return;
+    }
+
+    synthetic_wall_cols_ = static_cast<std::size_t>(cols_d);
+    synthetic_wall_rows_ = static_cast<std::size_t>(rows_d);
+    if (synthetic_wall_rows_ > kMaxWallCells / synthetic_wall_cols_)
+    {
+        synthetic_free_enable_ = false;
+        synthetic_wall_cols_ = 0;
+        synthetic_wall_rows_ = 0;
+        return;
+    }
+
+    synthetic_wall_cells_.reserve(synthetic_wall_cols_ * synthetic_wall_rows_);
+    for (std::size_t row = 0; row < synthetic_wall_rows_; ++row)
+    {
+        const double low = synthetic_wall_vertical_min_ +
+                           static_cast<double>(row) * synthetic_free_wall_cell_size_;
+        const double high = std::min(low + synthetic_free_wall_cell_size_,
+                                     synthetic_wall_vertical_max_);
+        const double vertical = 0.5 * (low + high);
+
+        for (std::size_t col = 0; col < synthetic_wall_cols_; ++col)
+        {
+            const double left = synthetic_wall_lateral_min_ +
+                                static_cast<double>(col) * synthetic_free_wall_cell_size_;
+            const double right = std::min(left + synthetic_free_wall_cell_size_,
+                                          synthetic_wall_lateral_max_);
+            synthetic_wall_cells_.push_back({0.5 * (left + right), vertical});
+        }
+    }
+
 }
 
 VDBMap::~VDBMap()
@@ -266,6 +395,31 @@ void VDBMap::setup_parameters()
 
     node_handle_->declare_parameter<double>("start_range", START_RANGE);
     node_handle_->declare_parameter<double>("sensor_range", SENSOR_RANGE);
+
+    // Shared FOV geometry. FFAPlanner checks for existing declarations and
+    // therefore reads these same values when both modules share one node.
+    node_handle_->declare_parameter<double>("body_sensor_x", body_sensor_x_);
+    node_handle_->declare_parameter<double>("body_sensor_y", body_sensor_y_);
+    node_handle_->declare_parameter<double>("body_sensor_z", body_sensor_z_);
+    node_handle_->declare_parameter<double>("body_sensor_roll", body_sensor_roll_);
+    node_handle_->declare_parameter<double>("body_sensor_pitch", body_sensor_pitch_);
+    node_handle_->declare_parameter<double>("body_sensor_yaw", body_sensor_yaw_);
+    node_handle_->declare_parameter<double>("fov_theta_u", fov_theta_u_);
+    node_handle_->declare_parameter<double>("fov_theta_d", fov_theta_d_);
+
+    node_handle_->declare_parameter<bool>("synthetic_free.enable", synthetic_free_enable_);
+    node_handle_->declare_parameter<double>("synthetic_free.horizontal_half_fov",
+                                            synthetic_free_horizontal_half_fov_);
+    node_handle_->declare_parameter<double>("synthetic_free.wall_cell_size",
+                                            synthetic_free_wall_cell_size_);
+    node_handle_->declare_parameter<double>("synthetic_free.carve_range",
+                                            synthetic_free_carve_range_);
+    node_handle_->declare_parameter<double>("synthetic_free.wall_range_margin",
+                                            synthetic_free_wall_range_margin_);
+    node_handle_->declare_parameter<int>("synthetic_free.update_stride",
+                                         synthetic_free_update_stride_);
+    node_handle_->declare_parameter<bool>("synthetic_free.log_stats",
+                                          synthetic_free_log_stats_);
 
     node_handle_->declare_parameter<int>("vdbedt_version", VERSION);
     node_handle_->declare_parameter<double>("max_update_dist", MAX_UPDATE_DIST);
@@ -409,6 +563,28 @@ bool VDBMap::load_mapping_para()
     report_double("vox_size", VOX_SIZE);
     report_double("start_range", START_RANGE);
     report_double("sensor_range", SENSOR_RANGE);
+    report_double("body_sensor_x", body_sensor_x_);
+    report_double("body_sensor_y", body_sensor_y_);
+    report_double("body_sensor_z", body_sensor_z_);
+    report_double("body_sensor_roll", body_sensor_roll_);
+    report_double("body_sensor_pitch", body_sensor_pitch_);
+    report_double("body_sensor_yaw", body_sensor_yaw_);
+    report_double("fov_theta_u", fov_theta_u_);
+    report_double("fov_theta_d", fov_theta_d_);
+    // Load synthetic parameters silently to keep the planner terminal clean.
+    node_handle_->get_parameter("synthetic_free.enable", synthetic_free_enable_);
+    node_handle_->get_parameter("synthetic_free.horizontal_half_fov",
+                                synthetic_free_horizontal_half_fov_);
+    node_handle_->get_parameter("synthetic_free.wall_cell_size",
+                                synthetic_free_wall_cell_size_);
+    node_handle_->get_parameter("synthetic_free.carve_range",
+                                synthetic_free_carve_range_);
+    node_handle_->get_parameter("synthetic_free.wall_range_margin",
+                                synthetic_free_wall_range_margin_);
+    node_handle_->get_parameter("synthetic_free.update_stride",
+                                synthetic_free_update_stride_);
+    node_handle_->get_parameter("synthetic_free.log_stats",
+                                synthetic_free_log_stats_);
     report_int("vdbedt_version", VERSION);
     report_double("max_update_dist", MAX_UPDATE_DIST);
     report_double("edt_update_duration", EDT_UPDATE_DURATION);
@@ -428,6 +604,11 @@ bool VDBMap::load_mapping_para()
     report_bool("enable_frontier_map", enable_frontier_map_);
     report_bool("enable_frontier_cluster", enable_frontier_cluster_);
     report_bool("enable_inflated_map", enable_inflated_map_);
+
+    if (synthetic_free_update_stride_ < 1)
+    {
+        synthetic_free_update_stride_ = 1;
+    }
 
     if (!enable_frontier_map_)
     {
@@ -1087,6 +1268,38 @@ void VDBMap::cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
         origin_transform.transform.translation.y,
         origin_transform.transform.translation.z);
 
+    bool run_synthetic_free = false;
+    double body_yaw = 0.0;
+    if (synthetic_free_enable_ && !synthetic_wall_cells_.empty())
+    {
+        const std::uint64_t sequence = synthetic_free_update_sequence_++;
+        run_synthetic_free =
+            (sequence % static_cast<std::uint64_t>(synthetic_free_update_stride_)) == 0;
+
+        if (run_synthetic_free)
+        {
+            try
+            {
+                const auto body_transform =
+                    tf_buffer_->lookupTransform(worldframeId, robotframeId,
+                                                pc_msg->header.stamp);
+                const auto &q_msg = body_transform.transform.rotation;
+                const tf2::Quaternion q(q_msg.x, q_msg.y, q_msg.z, q_msg.w);
+                double roll = 0.0;
+                double pitch = 0.0;
+                tf2::Matrix3x3(q).getRPY(roll, pitch, body_yaw);
+                if (!std::isfinite(body_yaw))
+                {
+                    run_synthetic_free = false;
+                }
+            }
+            catch (const tf2::TransformException &)
+            {
+                run_synthetic_free = false;
+            }
+        }
+    }
+
     // Convert to PCL XYZ
     auto xyz = std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
     pcl::fromROSMsg(pc_world, *xyz);
@@ -1096,7 +1309,7 @@ void VDBMap::cloud_callback(const sensor_msgs::msg::PointCloud2::ConstSharedPtr 
     // std::cout << "Running " << occu_update_count_ << " updates." << std::endl;
 
     timing::Timer update_OCC_timer("UpdateOccu");
-    this->update_occmap(grid_logocc_, origin_, xyz);
+    this->update_occmap(grid_logocc_, origin_, xyz, run_synthetic_free, body_yaw);
     update_OCC_timer.Stop();
 
     // timing::Timing::Print(std::cout);
@@ -1228,11 +1441,33 @@ void VDBMap::update_edtmap()
 
 void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
                            const Eigen::Vector3d &origin,
-                           std::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> xyz)
+                           std::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> xyz,
+                           bool run_synthetic_free,
+                           double body_yaw)
 {
-    // Accumulate log-odds deltas per voxel (no grid access here).
-    std::unordered_map<openvdb::Coord, float, CoordHash> ll_delta;
-    ll_delta.reserve(xyz->size() * 8);
+    struct VoxelEvidence
+    {
+        // Per-frame deduplication. A real hit dominates every free observation
+        // of the same leaf voxel.
+        bool real_free = false;
+        bool real_hit = false;
+        bool synthetic_free = false;
+    };
+
+    using EvidenceMap =
+        std::unordered_map<openvdb::Coord, VoxelEvidence, CoordHash>;
+
+    // A single hash table carries all current-frame evidence. Real and
+    // synthetic free observations are each applied at most once per leaf
+    // voxel; a current-frame sensor hit always wins.
+    EvidenceMap evidence;
+    // At the configured 0.1 m map/wall resolution, a 10 m frustum has
+    // roughly 20--25 unique voxels per wall bin after near-field overlap.
+    // Reserving accordingly avoids rehashing in the synthetic DDA hot path.
+    const std::size_t reserve_hint =
+        xyz->size() * 8 +
+        (run_synthetic_free ? synthetic_wall_cells_.size() * 24 : 0);
+    evidence.reserve(reserve_hint);
 
     // potential new frontiers
     std::unordered_set<openvdb::Coord, CoordHash> patch_local;
@@ -1240,52 +1475,237 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
     const openvdb::Vec3d origin_ijk =
         grid_map->worldToIndex(openvdb::Vec3d(origin.x(), origin.y(), origin.z()));
 
+    std::vector<std::uint8_t> wall_hit_mask;
+    Eigen::Vector3d forward_world = Eigen::Vector3d::UnitX();
+    Eigen::Vector3d horizontal_world = Eigen::Vector3d::UnitY();
+    Eigen::Vector3d vertical_world = Eigen::Vector3d::UnitZ();
+
+    if (run_synthetic_free)
+    {
+        wall_hit_mask.assign(synthetic_wall_cells_.size(), 0);
+
+        const Eigen::Matrix3d R_wb =
+            Eigen::AngleAxisd(body_yaw, Eigen::Vector3d::UnitZ()).toRotationMatrix();
+        const Eigen::Matrix3d R_bs =
+            (Eigen::AngleAxisd(body_sensor_yaw_, Eigen::Vector3d::UnitZ()) *
+             Eigen::AngleAxisd(body_sensor_pitch_, Eigen::Vector3d::UnitY()) *
+             Eigen::AngleAxisd(body_sensor_roll_, Eigen::Vector3d::UnitX()))
+                .toRotationMatrix();
+        const Eigen::Matrix3d R_ws = R_wb * R_bs;
+
+        forward_world = R_ws.col(0);
+        horizontal_world = R_ws.col(1);
+        vertical_world = R_ws.col(2);
+
+        for (const pcl::PointXYZ &pt : *xyz)
+        {
+            if (!std::isfinite(pt.x) || !std::isfinite(pt.y) ||
+                !std::isfinite(pt.z))
+            {
+                continue;
+            }
+
+            const Eigen::Vector3d delta(
+                static_cast<double>(pt.x) - origin.x(),
+                static_cast<double>(pt.y) - origin.y(),
+                static_cast<double>(pt.z) - origin.z());
+            const double forward = delta.dot(forward_world);
+            if (!(forward > 1e-6))
+            {
+                continue;
+            }
+
+            const double plane_scale = synthetic_wall_range_m_ / forward;
+            const double lateral = plane_scale * delta.dot(horizontal_world);
+            const double vertical = plane_scale * delta.dot(vertical_world);
+            if (lateral < synthetic_wall_lateral_min_ ||
+                lateral > synthetic_wall_lateral_max_ ||
+                vertical < synthetic_wall_vertical_min_ ||
+                vertical > synthetic_wall_vertical_max_)
+            {
+                continue;
+            }
+
+            const std::size_t col = std::min(
+                synthetic_wall_cols_ - 1,
+                static_cast<std::size_t>(
+                    (lateral - synthetic_wall_lateral_min_) /
+                    synthetic_free_wall_cell_size_));
+            const std::size_t row = std::min(
+                synthetic_wall_rows_ - 1,
+                static_cast<std::size_t>(
+                    (vertical - synthetic_wall_vertical_min_) /
+                    synthetic_free_wall_cell_size_));
+            const std::size_t index = row * synthetic_wall_cols_ + col;
+            wall_hit_mask[index] = 1;
+        }
+    }
+
     for (const pcl::PointXYZ &pt : *xyz)
     {
+        if (!std::isfinite(pt.x) || !std::isfinite(pt.y) ||
+            !std::isfinite(pt.z))
+        {
+            continue;
+        }
+
         const openvdb::Vec3d p_ijk =
             grid_map->worldToIndex(openvdb::Vec3d(pt.x, pt.y, pt.z));
         openvdb::Vec3d dir = p_ijk - origin_ijk;
         const double range = dir.length();
-        // if (range <= 1e-6)
-        //     {continue;}
-        if (range < START_RANGE)
+        if (!std::isfinite(range) || range <= 1e-6 || range < START_RANGE)
         {
             continue;
         }
         dir.normalize();
 
+        const bool has_hit = range <= SENSOR_RANGE;
+        const openvdb::Coord hit_coord = openvdb::Coord::floor(p_ijk);
+
         openvdb::math::Ray<double> ray(origin_ijk, dir);
         openvdb::math::DDA<openvdb::math::Ray<double>, 0> dda(
             ray, 0.0, std::min(SENSOR_RANGE, range));
 
-        // Free space along the ray (exclude the first hit voxel).
+        // Mark every traversed leaf voxel free exactly once, but never mark the
+        // actual endpoint voxel free. Coord::floor matches DDA::voxel().
         for (;;)
         {
             const openvdb::Coord cur = dda.voxel();
-            // If stepping further would exceed/meet maxTime, `cur` is the hit voxel → don't add FREE.
-            if (!(dda.time() < dda.maxTime()))
+            if ((has_hit && cur == hit_coord) ||
+                !(dda.time() < dda.maxTime()))
             {
                 break;
             }
-            ll_delta[cur] += static_cast<float>(L_FREE);
-            dda.step();
+            evidence[cur].real_free = true;
+            if (!dda.step())
+            {
+                break;
+            }
         }
 
-        // Hit (with thickness) only if not truncated by sensor range.
-        if (range <= SENSOR_RANGE)
+        if (has_hit)
         {
-            // first hit voxel
+            evidence[hit_coord].real_hit = true;
+
+            // Optional hit thickness starts at the true endpoint and advances
+            // into subsequent leaf voxels along the measured ray.
+            if (HIT_THICKNESS > 1)
             {
-                const openvdb::Coord hit = dda.voxel();
-                ll_delta[hit] += static_cast<float>(L_OCCU);
+                constexpr double kSqrtThree = 1.7320508075688772;
+                openvdb::math::DDA<openvdb::math::Ray<double>, 0> hit_dda(
+                    ray, range,
+                    range + static_cast<double>(HIT_THICKNESS) * kSqrtThree);
+                for (int i = 1; i < HIT_THICKNESS; ++i)
+                {
+                    if (!hit_dda.step())
+                    {
+                        break;
+                    }
+                    evidence[hit_dda.voxel()].real_hit = true;
+                }
             }
-            // extra thickness: step then add, until maxTime
-            for (int i = 1; i < HIT_THICKNESS; ++i)
+        }
+    }
+
+    std::vector<std::uint8_t> wall_reached_mask;
+    if (run_synthetic_free)
+    {
+        wall_reached_mask.assign(synthetic_wall_cells_.size(), 0);
+    }
+
+    if (run_synthetic_free)
+    {
+        // Historical occupancy is read before applying this frame. Current
+        // real hits live in evidence and take precedence as hard blockers.
+        std::shared_lock<std::shared_mutex> read_lock(map_mutex);
+        auto historical_acc = grid_map->getConstAccessor();
+        const float occ_thresh = static_cast<float>(L_THRESH);
+
+        for (std::size_t index = 0; index < synthetic_wall_cells_.size(); ++index)
+        {
+            if (wall_hit_mask[index] != 0)
+            {
+                continue;
+            }
+
+            const SyntheticWallCell &cell = synthetic_wall_cells_[index];
+            Eigen::Vector3d direction_world =
+                synthetic_wall_range_m_ * forward_world +
+                cell.lateral * horizontal_world +
+                cell.vertical * vertical_world;
+            const double direction_norm = direction_world.norm();
+            if (!std::isfinite(direction_norm) || direction_norm <= 1e-9)
+            {
+                continue;
+            }
+            direction_world /= direction_norm;
+
+            const Eigen::Vector3d unit_endpoint = origin + direction_world;
+            openvdb::Vec3d direction_ijk =
+                grid_map->worldToIndex(openvdb::Vec3d(
+                    unit_endpoint.x(), unit_endpoint.y(), unit_endpoint.z())) -
+                origin_ijk;
+            const double index_direction_norm = direction_ijk.length();
+            if (!std::isfinite(index_direction_norm) ||
+                index_direction_norm <= 1e-9)
+            {
+                continue;
+            }
+            direction_ijk.normalize();
+
+            bool blocked = false;
+            openvdb::math::Ray<double> ray(origin_ijk, direction_ijk);
+            openvdb::math::DDA<openvdb::math::Ray<double>, 0> dda(
+                ray, 0.0, synthetic_carve_range_ijk_);
+
+            for (;;)
             {
                 if (!(dda.time() < dda.maxTime()))
+                {
                     break;
-                dda.step();
-                ll_delta[dda.voxel()] += static_cast<float>(L_OCCU);
+                }
+
+                const openvdb::Coord cur = dda.voxel();
+                auto result = evidence.try_emplace(cur);
+                VoxelEvidence &voxel = result.first->second;
+
+                // Hard blocker: a raw endpoint from this registered scan.
+                if (voxel.real_hit)
+                {
+                    blocked = true;
+                    break;
+                }
+
+                float historical_logocc = 0.0f;
+                const bool historical_occupied =
+                    historical_acc.probeValue(cur, historical_logocc) &&
+                    historical_logocc >= occ_thresh;
+                if (historical_occupied)
+                {
+                    // Soft blocker: erode only this voxel once per frame, then
+                    // stop. Never clear any voxel behind an occupied barrier.
+                    if (!voxel.real_free)
+                    {
+                        voxel.synthetic_free = true;
+                    }
+                    blocked = true;
+                    break;
+                }
+
+                if (!voxel.real_free)
+                {
+                    voxel.synthetic_free = true;
+                }
+
+                if (!dda.step())
+                {
+                    break;
+                }
+            }
+
+            if (!blocked)
+            {
+                wall_reached_mask[index] = 1;
             }
         }
     }
@@ -1305,10 +1725,22 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
 
         const float occ_thresh = static_cast<float>(L_THRESH);
 
-        for (const auto &kv : ll_delta)
+        for (const auto &kv : evidence)
         {
             const openvdb::Coord &ijk = kv.first;
-            const float dL = kv.second;
+            const VoxelEvidence &voxel = kv.second;
+            // Current-frame endpoint evidence has strict priority. Free
+            // evidence is binary per leaf, so overlapping real and synthetic
+            // rays never multiply L_FREE within one scan.
+            const float dL = voxel.real_hit
+                                 ? static_cast<float>(L_OCCU)
+                                 : ((voxel.real_free || voxel.synthetic_free)
+                                        ? static_cast<float>(L_FREE)
+                                        : 0.0f);
+            if (dL == 0.0f)
+            {
+                continue;
+            }
 
             float ll_old = 0.0f;
             const bool known = acc.probeValue(ijk, ll_old);
@@ -1373,9 +1805,12 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
             {
                 const bool nowFree = (ll_new < occ_thresh);
                 const bool wasFree = (known && ll_old < occ_thresh);
-                if (nowFree && !wasFree)
+                if (!known || nowFree != wasFree)
                 {
-                    patch_local.insert(ijk); // potential new frontier must be new free (unknown->free or occ->free)
+                    // Recheck both newly known cells and free/occupied state
+                    // changes so stale frontiers are removed as well as new
+                    // frontiers discovered.
+                    patch_local.insert(ijk);
                 }
             }
         }
@@ -1386,6 +1821,61 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
         std::lock_guard<std::mutex> slk(swap_lock);
         patch_write->insert(patch_local.begin(), patch_local.end());
     }
+
+    // Debug the two masking stages separately:
+    //   unmasked  = wall bins with no projected return in this scan;
+    //   remaining = synthetic rays that also passed every voxel blocker and
+    //               actually reached the configured maximum range.
+    const auto publish_wall_mask =
+        [&](const rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr &publisher,
+            const std::vector<std::uint8_t> &mask,
+            bool select_active)
+    {
+        if (!run_synthetic_free || !publisher ||
+            publisher->get_subscription_count() == 0 ||
+            mask.size() != synthetic_wall_cells_.size())
+        {
+            return;
+        }
+
+        auto debug_cloud =
+            std::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+        debug_cloud->points.reserve(synthetic_wall_cells_.size());
+
+        for (std::size_t index = 0; index < synthetic_wall_cells_.size(); ++index)
+        {
+            const bool active = mask[index] != 0;
+            if (active != select_active)
+            {
+                continue;
+            }
+
+            const SyntheticWallCell &cell = synthetic_wall_cells_[index];
+            const Eigen::Vector3d point_world =
+                origin + synthetic_wall_range_m_ * forward_world +
+                cell.lateral * horizontal_world +
+                cell.vertical * vertical_world;
+            pcl::PointXYZ point;
+            point.x = static_cast<float>(point_world.x());
+            point.y = static_cast<float>(point_world.y());
+            point.z = static_cast<float>(point_world.z());
+            debug_cloud->points.push_back(point);
+        }
+
+        debug_cloud->width =
+            static_cast<std::uint32_t>(debug_cloud->points.size());
+        debug_cloud->height = 1;
+        debug_cloud->is_dense = true;
+
+        sensor_msgs::msg::PointCloud2 debug_msg;
+        pcl::toROSMsg(*debug_cloud, debug_msg);
+        debug_msg.header.frame_id = worldframeId;
+        debug_msg.header.stamp = node_handle_->now();
+        publisher->publish(debug_msg);
+    };
+
+    publish_wall_mask(synthetic_wall_unmasked_pub_, wall_hit_mask, false);
+    publish_wall_mask(synthetic_wall_remaining_pub_, wall_reached_mask, true);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
