@@ -30,6 +30,7 @@
  */
 
 #include "vdb_edt/vdbmap.h"
+#include "vdb_edt/ray_trace_util.h"
 #include <cmath>
 // NOTE(ROS2): Needed for tf2::doTransform on sensor_msgs::msg::PointCloud2
 #include <tf2_sensor_msgs/tf2_sensor_msgs.hpp>
@@ -115,6 +116,15 @@ void VDBMap::initialize()
     openvdb::initialize();
     grid_logocc_ = openvdb::FloatGrid::create(0.0);
     this->set_voxel_size(*grid_logocc_, VOX_SIZE);
+    if (DEBUG_WATCH_VOXEL)
+    {
+        watch_ijk_ = openvdb::Coord::round(
+            grid_logocc_->worldToIndex(openvdb::Vec3d(WATCH_X, WATCH_Y, WATCH_Z)));
+        RCLCPP_WARN(node_handle_->get_logger(),
+                    "[VDBMap] watching voxel [%d,%d,%d] (world %.2f,%.2f,%.2f)",
+                    watch_ijk_.x(), watch_ijk_.y(), watch_ijk_.z(),
+                    WATCH_X, WATCH_Y, WATCH_Z);
+    }
 
     if (enable_inflated_map_)
     {
@@ -262,6 +272,13 @@ void VDBMap::setup_parameters()
     node_handle_->declare_parameter<double>("l_max", L_MAX);
     node_handle_->declare_parameter<double>("l_min", L_MIN);
     node_handle_->declare_parameter<double>("l_thresh", L_THRESH);
+    node_handle_->declare_parameter<bool>("occ_frame_clamp", OCC_FRAME_CLAMP);
+    node_handle_->declare_parameter<double>("l_free_frame", L_FREE_FRAME);
+    node_handle_->declare_parameter<bool>("shorten_band_clearance", SHORTEN_BAND_CLEARANCE);
+    node_handle_->declare_parameter<bool>("debug_watch_voxel", DEBUG_WATCH_VOXEL);
+    node_handle_->declare_parameter<double>("watch_x", WATCH_X);
+    node_handle_->declare_parameter<double>("watch_y", WATCH_Y);
+    node_handle_->declare_parameter<double>("watch_z", WATCH_Z);
     node_handle_->declare_parameter<double>("vox_size", VOX_SIZE);
 
     node_handle_->declare_parameter<double>("start_range", START_RANGE);
@@ -406,6 +423,13 @@ bool VDBMap::load_mapping_para()
     report_double("l_max", L_MAX);
     report_double("l_min", L_MIN);
     report_double("l_thresh", L_THRESH);
+    report_bool("occ_frame_clamp", OCC_FRAME_CLAMP);
+    report_double("l_free_frame", L_FREE_FRAME);
+    report_bool("shorten_band_clearance", SHORTEN_BAND_CLEARANCE);
+    report_bool("debug_watch_voxel", DEBUG_WATCH_VOXEL);
+    report_double("watch_x", WATCH_X);
+    report_double("watch_y", WATCH_Y);
+    report_double("watch_z", WATCH_Z);
     report_double("vox_size", VOX_SIZE);
     report_double("start_range", START_RANGE);
     report_double("sensor_range", SENSOR_RANGE);
@@ -824,6 +848,29 @@ bool VDBMap::ray_esdf_clear_index_optimistic(const openvdb::Coord &c0,
     return true;
 }
 
+// Segment checks below use the exact Amanatides-Woo traversal from
+// ray_trace_util.h (the former max-axis samplers could skip voxels the
+// segment actually crosses - same thin-sheet hole as the LoS rayTraceClear
+// family, fixed 2026-08-14). Endpoints ARE checked (they are path voxels
+// asserted traversable by the caller's search, but flicker may have changed
+// them; the greedy shorteners degrade gracefully on failure).
+namespace
+{
+template <typename BlockedFn>
+inline bool segmentClearIncl(const openvdb::math::Transform &tf,
+                             const openvdb::Coord &c0, const openvdb::Coord &c1,
+                             BlockedFn &&blocked)
+{
+    if (blocked(c0) || blocked(c1))
+    {
+        return false;
+    }
+    return ffa::rayTraceVisitClear(tf,
+                                   tf.indexToWorld(c0), tf.indexToWorld(c1),
+                                   std::forward<BlockedFn>(blocked));
+}
+} // namespace
+
 bool VDBMap::ray_inflated_clear_index(const openvdb::Coord &c0,
                                       const openvdb::Coord &c1) const
 {
@@ -831,42 +878,15 @@ bool VDBMap::ray_inflated_clear_index(const openvdb::Coord &c0,
     {
         return false;
     }
-
-    const int dx = c1.x() - c0.x();
-    const int dy = c1.y() - c0.y();
-    const int dz = c1.z() - c0.z();
-
-    const int steps = std::max({std::abs(dx), std::abs(dy), std::abs(dz)});
-    if (steps == 0)
-    {
-        int val = 0;
-        bool active = query_is_inflated_at_index(c0, val);
-        return !(active && (val % FRONTIER_INFLATION_DELTA) > 0);
-    }
-
-    const double inv = 1.0 / steps;
-    const double sx = dx * inv;
-    const double sy = dy * inv;
-    const double sz = dz * inv;
-
     std::shared_lock<std::shared_mutex> rlk(map_mutex);
     openvdb::Int32Grid::ConstAccessor inf_acc = grid_inflated_->getConstAccessor();
-
-    for (int i = 0; i <= steps; ++i)
-    {
-        const openvdb::Coord vox(
-            c0.x() + static_cast<int>(std::round(sx * i)),
-            c0.y() + static_cast<int>(std::round(sy * i)),
-            c0.z() + static_cast<int>(std::round(sz * i)));
-
-        int inflate_val = 0;
-        bool is_inflated = query_is_inflated_at_index(vox, inflate_val, inf_acc);
-        if (is_inflated && (inflate_val % FRONTIER_INFLATION_DELTA) > 0)
-        {
-            return false;
-        }
-    }
-    return true;
+    return segmentClearIncl(
+        grid_inflated_->transform(), c0, c1,
+        [&](const openvdb::Coord &vox) {
+            int inflate_val = 0;
+            const bool active = query_is_inflated_at_index(vox, inflate_val, inf_acc);
+            return active && (inflate_val % FRONTIER_INFLATION_DELTA) > 0;
+        });
 }
 
 bool VDBMap::ray_all_inflated_clear_index(const openvdb::Coord &c0,
@@ -876,42 +896,118 @@ bool VDBMap::ray_all_inflated_clear_index(const openvdb::Coord &c0,
     {
         return false;
     }
-
-    const int dx = c1.x() - c0.x();
-    const int dy = c1.y() - c0.y();
-    const int dz = c1.z() - c0.z();
-
-    const int steps = std::max({std::abs(dx), std::abs(dy), std::abs(dz)});
-    if (steps == 0)
-    {
-        int val = 0;
-        bool active = query_is_inflated_at_index(c0, val);
-        return !(active && val > 0);
-    }
-
-    const double inv = 1.0 / steps;
-    const double sx = dx * inv;
-    const double sy = dy * inv;
-    const double sz = dz * inv;
-
     std::shared_lock<std::shared_mutex> rlk(map_mutex);
     openvdb::Int32Grid::ConstAccessor inf_acc = grid_inflated_->getConstAccessor();
+    return segmentClearIncl(
+        grid_inflated_->transform(), c0, c1,
+        [&](const openvdb::Coord &vox) {
+            int inflate_val = 0;
+            const bool active = query_is_inflated_at_index(vox, inflate_val, inf_acc);
+            return active && inflate_val > 0;
+        });
+}
 
-    for (int i = 0; i <= steps; ++i)
+// Banded variants for path SHORTENING: interior voxels must additionally
+// keep one voxel of standoff from occ-inflated space (none of the 6 face
+// neighbors occ-blocked) so shortcuts cannot be pulled taut against the
+// inflation boundary, where +-1-voxel occupancy breathing invalidates them
+// mid-flight. Segment ENDPOINTS are exempt from the band (they are given
+// path points, possibly legitimately wall-adjacent). With
+// SHORTEN_BAND_CLEARANCE=false these are identical to the plain variants.
+// The greedy shorteners degrade gracefully: a span that cannot be shortcut
+// under the band simply keeps its raw A* waypoints (feasibility never
+// shrinks - the raw path itself is not re-tested here).
+bool VDBMap::ray_inflated_clear_index_banded(const openvdb::Coord &c0,
+                                             const openvdb::Coord &c1) const
+{
+    if (!SHORTEN_BAND_CLEARANCE)
     {
-        const openvdb::Coord vox(
-            c0.x() + static_cast<int>(std::round(sx * i)),
-            c0.y() + static_cast<int>(std::round(sy * i)),
-            c0.z() + static_cast<int>(std::round(sz * i)));
-
-        int inflate_val = 0;
-        bool is_inflated = query_is_inflated_at_index(vox, inflate_val, inf_acc);
-        if (is_inflated && inflate_val > 0)
-        {
-            return false;
-        }
+        return ray_inflated_clear_index(c0, c1);
     }
-    return true;
+    if (!grid_inflated_)
+    {
+        return false;
+    }
+    std::shared_lock<std::shared_mutex> rlk(map_mutex);
+    openvdb::Int32Grid::ConstAccessor inf_acc = grid_inflated_->getConstAccessor();
+    const auto occ_blocked = [&](const openvdb::Coord &vox) {
+        int inflate_val = 0;
+        const bool active = query_is_inflated_at_index(vox, inflate_val, inf_acc);
+        return active && (inflate_val % FRONTIER_INFLATION_DELTA) > 0;
+    };
+    if (occ_blocked(c0) || occ_blocked(c1))
+    {
+        return false;
+    }
+    return ffa::rayTraceVisitClear(
+        grid_inflated_->transform(),
+        grid_inflated_->transform().indexToWorld(c0),
+        grid_inflated_->transform().indexToWorld(c1),
+        [&](const openvdb::Coord &vox) {
+            if (occ_blocked(vox))
+            {
+                return true;
+            }
+            static const int face[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                           {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+            for (const auto &f : face)
+            {
+                if (occ_blocked(vox.offsetBy(f[0], f[1], f[2])))
+                {
+                    return true; // inside the boundary band
+                }
+            }
+            return false;
+        });
+}
+
+bool VDBMap::ray_all_inflated_clear_index_banded(const openvdb::Coord &c0,
+                                                 const openvdb::Coord &c1) const
+{
+    if (!SHORTEN_BAND_CLEARANCE)
+    {
+        return ray_all_inflated_clear_index(c0, c1);
+    }
+    if (!grid_inflated_)
+    {
+        return false;
+    }
+    std::shared_lock<std::shared_mutex> rlk(map_mutex);
+    openvdb::Int32Grid::ConstAccessor inf_acc = grid_inflated_->getConstAccessor();
+    const auto any_blocked = [&](const openvdb::Coord &vox) {
+        int inflate_val = 0;
+        const bool active = query_is_inflated_at_index(vox, inflate_val, inf_acc);
+        return active && inflate_val > 0;
+    };
+    const auto occ_blocked = [&](const openvdb::Coord &vox) {
+        int inflate_val = 0;
+        const bool active = query_is_inflated_at_index(vox, inflate_val, inf_acc);
+        return active && (inflate_val % FRONTIER_INFLATION_DELTA) > 0;
+    };
+    if (any_blocked(c0) || any_blocked(c1))
+    {
+        return false;
+    }
+    return ffa::rayTraceVisitClear(
+        grid_inflated_->transform(),
+        grid_inflated_->transform().indexToWorld(c0),
+        grid_inflated_->transform().indexToWorld(c1),
+        [&](const openvdb::Coord &vox) {
+            if (any_blocked(vox))
+            {
+                return true;
+            }
+            static const int face[6][3] = {{1, 0, 0}, {-1, 0, 0}, {0, 1, 0},
+                                           {0, -1, 0}, {0, 0, 1}, {0, 0, -1}};
+            for (const auto &f : face)
+            {
+                if (occ_blocked(vox.offsetBy(f[0], f[1], f[2])))
+                {
+                    return true; // inside the boundary band
+                }
+            }
+            return false;
+        });
 }
 
 // Inflation of occ voxel grid
@@ -1230,8 +1326,16 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
                            const Eigen::Vector3d &origin,
                            std::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> xyz)
 {
-    // Accumulate log-odds deltas per voxel (no grid access here).
-    std::unordered_map<openvdb::Coord, float, CoordHash> ll_delta;
+    // Accumulate per-voxel evidence for this cloud (no grid access here).
+    // sum: legacy per-ray accumulation; hit/freed: per-frame flags for the
+    // dedup path (OCC_UPDATE_DEDUP).
+    struct VoxelEvidence
+    {
+        float sum = 0.0f;
+        uint16_t n_hit = 0;   // diagnostic (watch probe) only
+        uint16_t n_free = 0;  // diagnostic (watch probe) only
+    };
+    std::unordered_map<openvdb::Coord, VoxelEvidence, CoordHash> ll_delta;
     ll_delta.reserve(xyz->size() * 8);
 
     // potential new frontiers
@@ -1267,7 +1371,9 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
             {
                 break;
             }
-            ll_delta[cur] += static_cast<float>(L_FREE);
+            VoxelEvidence &ev = ll_delta[cur];
+            ev.sum += static_cast<float>(L_FREE);
+            ++ev.n_free;
             dda.step();
         }
 
@@ -1277,7 +1383,9 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
             // first hit voxel
             {
                 const openvdb::Coord hit = dda.voxel();
-                ll_delta[hit] += static_cast<float>(L_OCCU);
+                VoxelEvidence &ev = ll_delta[hit];
+                ev.sum += static_cast<float>(L_OCCU);
+                ++ev.n_hit;
             }
             // extra thickness: step then add, until maxTime
             for (int i = 1; i < HIT_THICKNESS; ++i)
@@ -1285,7 +1393,9 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
                 if (!(dda.time() < dda.maxTime()))
                     break;
                 dda.step();
-                ll_delta[dda.voxel()] += static_cast<float>(L_OCCU);
+                VoxelEvidence &ev = ll_delta[dda.voxel()];
+                ev.sum += static_cast<float>(L_OCCU);
+                ++ev.n_hit;
             }
         }
     }
@@ -1308,7 +1418,19 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
         for (const auto &kv : ll_delta)
         {
             const openvdb::Coord &ijk = kv.first;
-            const float dL = kv.second;
+            const VoxelEvidence &ev = kv.second;
+            // Per-cloud delta: the per-ray probabilistic sum (its SIGN is
+            // the hit-fraction odds test that correctly classifies partial
+            // occupancy - thin obstacles, boundary-straddling surface
+            // voxels, silhouette edge-bleed), optionally CLAMPED per cloud
+            // to [L_FREE_FRAME, +L_OCCU] to remove ray-count amplification
+            // (single-cloud +-3 swings across the threshold = flicker).
+            float dL = ev.sum;
+            if (OCC_FRAME_CLAMP)
+            {
+                dL = std::clamp(dL, static_cast<float>(L_FREE_FRAME),
+                                static_cast<float>(L_OCCU));
+            }
 
             float ll_old = 0.0f;
             const bool known = acc.probeValue(ijk, ll_old);
@@ -1316,6 +1438,15 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
             const float ll_new = std::clamp(ll_old + dL,
                                             static_cast<float>(L_MIN),
                                             static_cast<float>(L_MAX));
+
+            if (DEBUG_WATCH_VOXEL && ijk == watch_ijk_)
+            {
+                RCLCPP_WARN(node_handle_->get_logger(),
+                            "[Watch] hits=%u free=%u sum=%.2f dL=%.2f ll %.2f -> %.2f (%s -> %s)",
+                            ev.n_hit, ev.n_free, ev.sum, dL, ll_old, ll_new,
+                            (known ? (ll_old >= occ_thresh ? "OCC" : "free") : "unk"),
+                            (ll_new >= occ_thresh ? "OCC" : "free"));
+            }
 
             if (!known)
             {

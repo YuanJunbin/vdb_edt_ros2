@@ -142,6 +142,10 @@ public:
                                          double min_clearance,
                                          openvdb::Coord &hit_point) const;
 
+    bool ray_inflated_clear_index_banded(const openvdb::Coord &c0,
+                                         const openvdb::Coord &c1) const;
+    bool ray_all_inflated_clear_index_banded(const openvdb::Coord &c0,
+                                             const openvdb::Coord &c1) const;
     bool ray_inflated_clear_index(const openvdb::Coord &c0,
                                   const openvdb::Coord &c1) const;
 
@@ -166,6 +170,32 @@ private:
     double L_FREE, L_OCCU, L_THRESH, L_MIN, L_MAX, VOX_SIZE;
     double START_RANGE, SENSOR_RANGE;
     int HIT_THICKNESS;
+
+    // Flicker robustness (default false = legacy bit-identical; the map
+    // stays a single-value log-odds grid with a single threshold).
+    // OCC_FRAME_CLAMP bounds the per-voxel PER-CLOUD delta to
+    // [L_FREE_FRAME, +L_OCCU] while keeping the per-ray probabilistic sum:
+    // the hit:miss RATIO already encodes partial occupancy correctly (a
+    // voxel is net-positive iff its hit fraction exceeds the L_FREE/L_OCCU
+    // odds, ~11%), so thin obstacles and boundary-straddling surface voxels
+    // classify exactly as in legacy; what the clamp removes is the RAY-COUNT
+    // amplification (a single cloud swinging a voxel by +-3 across the
+    // threshold), which is the boundary/edge-bleed flicker mechanism. A new
+    // real obstacle still registers in one cloud (any net-positive frame
+    // crosses the unknown->occupied threshold); dense-ray ghost erase is
+    // capped at L_FREE_FRAME per cloud (~1 s from saturation @10 Hz).
+    bool OCC_FRAME_CLAMP = false;
+    double L_FREE_FRAME = -0.35;
+
+    // Path-shortening standoff: banded segment checks require interior
+    // voxels to keep 1 voxel from occ-inflated space (see the *_banded
+    // segment checks). false = banded variants behave exactly like plain.
+    bool SHORTEN_BAND_CLEARANCE = false;
+
+    // Debug probe: per-cloud evidence trace for one voxel (world coords).
+    bool DEBUG_WATCH_VOXEL = false;
+    double WATCH_X = 0.0, WATCH_Y = 0.0, WATCH_Z = 0.0;
+    openvdb::Coord watch_ijk_{0, 0, 0};
 
     // VDB map
     int VERSION;
@@ -248,6 +278,13 @@ public:
     std::queue<sensor_msgs::msg::PointCloud2::ConstSharedPtr> cloud_queue_;
 
 public:
+    // Read-only geometry accessors so planners can size robot-body tests
+    // (e.g. bootstrap exemption boxes) with the exact same radii the
+    // inflation kernel uses.
+    double voxel_size() const { return VOX_SIZE; }
+    double robot_radius_xy() const { return safe_robot_radius_xy_; }
+    double robot_height_z() const { return safe_robot_height_z_; }
+
     // a hash tool, for lower version of openvdb without coord hash
 private:
     struct CoordHash
