@@ -220,6 +220,12 @@ private:
     bool enable_frontier_map_;
     bool enable_frontier_cluster_;
     bool enable_inflated_map_;
+    // Occupied-shell channel: N26-style cube dilation (radius occ_shell_radius_)
+    // of the RAW occupied voxels, kept as a separate incremental counter grid.
+    // Used by the planner to detect rays that graze a known obstacle edge
+    // (line-of-sight clearance), independent of the body-inflation box.
+    bool enable_occ_shell_map_ = false;
+    int occ_shell_radius_ = 1;
 
 public:
     std::string get_node_name() const;
@@ -228,6 +234,15 @@ public:
     std::shared_mutex &get_map_mutex() const;
 
     openvdb::Int32Grid::ConstAccessor get_inflated_accessor() const;
+    // Occ-shell grid accessor (see enable_occ_shell_map_). Throws if disabled.
+    openvdb::Int32Grid::ConstAccessor get_occ_shell_accessor() const;
+    bool has_occ_shell_map() const { return static_cast<bool>(grid_occ_shell_); }
+    // True if ijk lies within occ_shell_radius_ (Chebyshev) of a known-occupied voxel.
+    bool query_is_occ_shell_at_index(const openvdb::Coord &ijk) const;
+    bool query_is_occ_shell_at_index(const openvdb::Coord &ijk,
+                                     openvdb::Int32Grid::ConstAccessor &acc) const;
+    // Monotone count of processed point clouds (occupancy updates).
+    int get_occu_update_count() const { return occu_update_count_; }
     openvdb::FloatGrid::ConstAccessor get_logocc_accessor() const;
     const std::vector<openvdb::Coord> &get_inflation_kernel() const { return inflation_kernel_; }
     void extractInflatedPointsInBox(const openvdb::CoordBBox &bbox,
@@ -327,6 +342,13 @@ private: // occupancy map
     openvdb::Int32Grid::Ptr grid_inflated_;
     std::vector<openvdb::Coord> inflation_kernel_;
     std::vector<openvdb::Coord> frontier_inflation_kernel_;
+
+    // Occ-shell grid (see enable_occ_shell_map_)
+    openvdb::Int32Grid::Ptr grid_occ_shell_;
+    std::vector<openvdb::Coord> occ_shell_kernel_;
+    void apply_occ_shell(openvdb::Int32Grid::Accessor &shell_acc,
+                         const openvdb::Coord &center,
+                         int delta);
 
     void build_inflation_kernel();
     void apply_inflation(openvdb::Int32Grid::Accessor &inf_acc,

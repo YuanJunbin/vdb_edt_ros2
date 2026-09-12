@@ -136,6 +136,21 @@ void VDBMap::initialize()
         frontier_inflated_vis_pub_ = node_handle_->create_publisher<sensor_msgs::msg::PointCloud2>("/frontier_inflated_grid", 5);
     }
 
+    if (enable_occ_shell_map_)
+    {
+        grid_occ_shell_ = openvdb::Int32Grid::create(0);
+        grid_occ_shell_->setTransform(grid_logocc_->transform().copy());
+        const int r = std::max(1, occ_shell_radius_);
+        occ_shell_kernel_.clear();
+        for (int x = -r; x <= r; ++x)
+            for (int y = -r; y <= r; ++y)
+                for (int z = -r; z <= r; ++z)
+                    occ_shell_kernel_.push_back(openvdb::Coord(x, y, z));
+        RCLCPP_INFO(node_handle_->get_logger(),
+                    "[VDBMap] occ-shell grid enabled (radius %d, kernel %zu)",
+                    r, occ_shell_kernel_.size());
+    }
+
     if (enable_dist_map_)
     {
         max_coor_dist_ = static_cast<int>(MAX_UPDATE_DIST / VOX_SIZE);
@@ -304,6 +319,8 @@ void VDBMap::setup_parameters()
     node_handle_->declare_parameter<bool>("enable_frontier_map", true);
     node_handle_->declare_parameter<bool>("enable_frontier_cluster", true);
     node_handle_->declare_parameter<bool>("enable_inflated_map", true);
+    node_handle_->declare_parameter<bool>("enable_occ_shell_map", false);
+    node_handle_->declare_parameter<int>("occ_shell_radius", 1);
 
     node_handle_->declare_parameter<double>("safe_robot_radius_xy", 0.5);
     node_handle_->declare_parameter<double>("safe_robot_height_z", 0.2);
@@ -451,7 +468,8 @@ bool VDBMap::load_mapping_para()
     report_bool("enable_inflated_map", enable_inflated_map_);
     report_bool("enable_frontier_map", enable_frontier_map_);
     report_bool("enable_frontier_cluster", enable_frontier_cluster_);
-    report_bool("enable_inflated_map", enable_inflated_map_);
+    report_bool("enable_occ_shell_map", enable_occ_shell_map_);
+    report_int("occ_shell_radius", occ_shell_radius_);
 
     if (!enable_frontier_map_)
     {
@@ -487,6 +505,34 @@ openvdb::Int32Grid::ConstAccessor VDBMap::get_inflated_accessor() const
         throw std::runtime_error("Inflated grid is null.");
     }
     return grid_inflated_->getConstAccessor();
+}
+
+openvdb::Int32Grid::ConstAccessor VDBMap::get_occ_shell_accessor() const
+{
+    if (!grid_occ_shell_)
+    {
+        RCLCPP_ERROR(node_handle_->get_logger(), "Occ-shell grid is not initialized! Cannot get accessor.");
+        throw std::runtime_error("Occ-shell grid is null.");
+    }
+    return grid_occ_shell_->getConstAccessor();
+}
+
+bool VDBMap::query_is_occ_shell_at_index(const openvdb::Coord &ijk) const
+{
+    if (!grid_occ_shell_)
+    {
+        return false;
+    }
+    std::shared_lock<std::shared_mutex> rlk(map_mutex);
+    int v = 0;
+    return grid_occ_shell_->getConstAccessor().probeValue(ijk, v) && v > 0;
+}
+
+bool VDBMap::query_is_occ_shell_at_index(const openvdb::Coord &ijk,
+                                         openvdb::Int32Grid::ConstAccessor &acc) const
+{
+    int v = 0;
+    return acc.probeValue(ijk, v) && v > 0;
 }
 
 void VDBMap::extractInflatedPointsInBox(const openvdb::CoordBBox &bbox,
@@ -1114,6 +1160,28 @@ inline void VDBMap::apply_frontier_inflation(openvdb::Int32Grid::Accessor &inf_a
     }
 }
 
+inline void VDBMap::apply_occ_shell(openvdb::Int32Grid::Accessor &shell_acc,
+                                    const openvdb::Coord &center,
+                                    int delta)
+{
+    for (const auto &offset : occ_shell_kernel_)
+    {
+        openvdb::Coord target = center + offset;
+        int old_val = 0;
+        shell_acc.probeValue(target, old_val);
+        int new_val = old_val + delta;
+
+        if (new_val > 0)
+        {
+            shell_acc.setValueOn(target, new_val);
+        }
+        else
+        {
+            shell_acc.setValueOff(target, 0);
+        }
+    }
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 // Callbacks
 
@@ -1412,6 +1480,11 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
         {
             inf_acc_ptr = std::make_unique<openvdb::Int32Grid::Accessor>(grid_inflated_->getAccessor());
         }
+        std::unique_ptr<openvdb::Int32Grid::Accessor> shell_acc_ptr;
+        if (grid_occ_shell_)
+        {
+            shell_acc_ptr = std::make_unique<openvdb::Int32Grid::Accessor>(grid_occ_shell_->getAccessor());
+        }
 
         const float occ_thresh = static_cast<float>(L_THRESH);
 
@@ -1467,6 +1540,10 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
                 {
                     apply_inflation(*inf_acc_ptr, ijk, +1);
                 }
+                if (shell_acc_ptr && ll_new >= occ_thresh)
+                {
+                    apply_occ_shell(*shell_acc_ptr, ijk, +1);
+                }
             }
             else
             {
@@ -1497,6 +1574,17 @@ void VDBMap::update_occmap(openvdb::FloatGrid::Ptr grid_map,
                     else if (wasOcc && !nowOcc)
                     {
                         apply_inflation(*inf_acc_ptr, ijk, -1);
+                    }
+                }
+                if (shell_acc_ptr)
+                {
+                    if (!wasOcc && nowOcc)
+                    {
+                        apply_occ_shell(*shell_acc_ptr, ijk, +1);
+                    }
+                    else if (wasOcc && !nowOcc)
+                    {
+                        apply_occ_shell(*shell_acc_ptr, ijk, -1);
                     }
                 }
             }
